@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/signaling-server",
+    "crates/streamer-client",
+    "crates/common"
+]
+
+[workspace.dependencies]
+serde = {version = "1", features = ["derive"]}
