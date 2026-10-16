@@ -3,13 +3,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 #[serde(tag = "type")]
 pub enum SignalMessage {
-    Offer { 
-        sdp: String 
+    Offer {
+        sdp: String,
     },
-    Answer { 
-        sdp: String 
+    Answer {
+        sdp: String,
     },
-    Ice { 
+    Ice {
         candidate: String,
 
         #[serde(rename = "sdpMid", skip_serializing_if = "Option::is_none")]
@@ -19,7 +19,7 @@ pub enum SignalMessage {
         sdp_mline_index: Option<u16>,
 
         #[serde(rename = "usernameFragment", skip_serializing_if = "Option::is_none")]
-        username_fragment: Option<String>, 
+        username_fragment: Option<String>,
     },
 }
 
@@ -28,14 +28,30 @@ pub struct ViewerId(pub u32);
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 #[serde(tag = "type")]
-pub enum ServerMessage {
-    PeerJoined { id: ViewerId },
-    PeerLeft { id: ViewerId },
+pub enum ServerToHost {
+    ViewerJoined {
+        viewer_id: ViewerId,
+    },
+    ViewerLeft {
+        viewer_id: ViewerId,
+    },
+    SignalFromViewer {
+        from: ViewerId,
+        message: SignalMessage,
+    },
+    ViewerList {
+        viewers: Vec<ViewerId>,
+    },
 }
 
-
-
-
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+#[serde(tag = "type")]
+pub enum HostToServer {
+    SignalToViewer {
+        to: ViewerId,
+        message: SignalMessage,
+    },
+}
 
 #[cfg(test)]
 mod tests {
@@ -202,54 +218,174 @@ mod tests {
     }
 
     #[test]
-    fn test_server_message_peer_joined_serialization_and_deserialization() {
-        let msg = ServerMessage::PeerJoined {
-            id: ViewerId(7),
+    fn test_server_to_host_viewer_joined_serialization_and_deserialization() {
+        let msg = ServerToHost::ViewerJoined {
+            viewer_id: ViewerId(7),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"PeerJoined","id":7}"#);
+        assert_eq!(json, r#"{"type":"ViewerJoined","viewer_id":7}"#);
 
-        let deserialized: ServerMessage = serde_json::from_str(&json).unwrap();
+        let deserialized: ServerToHost = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, msg);
     }
 
     #[test]
-    fn test_server_message_peer_left_serialization_and_deserialization() {
-        let msg = ServerMessage::PeerLeft {
-            id: ViewerId(7),
+    fn test_server_to_host_viewer_left_serialization_and_deserialization() {
+        let msg = ServerToHost::ViewerLeft {
+            viewer_id: ViewerId(7),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"PeerLeft","id":7}"#);
+        assert_eq!(json, r#"{"type":"ViewerLeft","viewer_id":7}"#);
 
-        let deserialized: ServerMessage = serde_json::from_str(&json).unwrap();
+        let deserialized: ServerToHost = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, msg);
     }
 
     #[test]
-    fn test_server_message_deserialize_invalid_type() {
-        let json = r#"{"type":"UnknownPeer","id":1}"#;
-        assert!(serde_json::from_str::<ServerMessage>(json).is_err());
+    fn test_server_to_host_signal_from_viewer_serialization_and_deserialization() {
+        let msg = ServerToHost::SignalFromViewer {
+            from: ViewerId(42),
+            message: SignalMessage::Offer {
+                sdp: "offer_sdp".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"SignalFromViewer","from":42,"message":{"type":"Offer","sdp":"offer_sdp"}}"#
+        );
+
+        let deserialized: ServerToHost = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, msg);
     }
 
     #[test]
-    fn test_server_message_deserialize_missing_fields() {
-        // Sem id obrigatório
-        let json_no_id = r#"{"type":"PeerJoined"}"#;
-        assert!(serde_json::from_str::<ServerMessage>(json_no_id).is_err());
+    fn test_server_to_host_viewer_list_serialization_and_deserialization() {
+        // Lista com elementos
+        let msg = ServerToHost::ViewerList {
+            viewers: vec![ViewerId(1), ViewerId(2), ViewerId(3)],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(json, r#"{"type":"ViewerList","viewers":[1,2,3]}"#);
+
+        let deserialized: ServerToHost = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, msg);
+
+        // Lista vazia
+        let empty_msg = ServerToHost::ViewerList { viewers: vec![] };
+        let empty_json = serde_json::to_string(&empty_msg).unwrap();
+        assert_eq!(empty_json, r#"{"type":"ViewerList","viewers":[]}"#);
+
+        let deserialized_empty: ServerToHost = serde_json::from_str(&empty_json).unwrap();
+        assert_eq!(deserialized_empty, empty_msg);
+    }
+
+    #[test]
+    fn test_server_to_host_deserialize_invalid_type() {
+        let json = r#"{"type":"UnknownType","viewer_id":1}"#;
+        assert!(serde_json::from_str::<ServerToHost>(json).is_err());
+    }
+
+    #[test]
+    fn test_server_to_host_deserialize_missing_fields() {
+        // Sem viewer_id em ViewerJoined
+        let json_no_viewer_id = r#"{"type":"ViewerJoined"}"#;
+        assert!(serde_json::from_str::<ServerToHost>(json_no_viewer_id).is_err());
+
+        // Sem message em SignalFromViewer
+        let json_no_message = r#"{"type":"SignalFromViewer","from":1}"#;
+        assert!(serde_json::from_str::<ServerToHost>(json_no_message).is_err());
+
+        // Sem viewers em ViewerList
+        let json_no_viewers = r#"{"type":"ViewerList"}"#;
+        assert!(serde_json::from_str::<ServerToHost>(json_no_viewers).is_err());
 
         // Sem a tag type
-        let json_no_type = r#"{"id":1}"#;
-        assert!(serde_json::from_str::<ServerMessage>(json_no_type).is_err());
+        let json_no_type = r#"{"viewer_id":1}"#;
+        assert!(serde_json::from_str::<ServerToHost>(json_no_type).is_err());
     }
 
     #[test]
-    fn test_server_message_deserialize_ignores_unknown_fields() {
-        let json = r#"{"type":"PeerJoined","id":10,"metadata":"extra"}"#;
-        let deserialized: ServerMessage = serde_json::from_str(json).unwrap();
+    fn test_server_to_host_deserialize_ignores_unknown_fields() {
+        let json = r#"{"type":"ViewerJoined","viewer_id":10,"metadata":"extra"}"#;
+        let deserialized: ServerToHost = serde_json::from_str(json).unwrap();
         assert_eq!(
             deserialized,
-            ServerMessage::PeerJoined {
-                id: ViewerId(10)
+            ServerToHost::ViewerJoined {
+                viewer_id: ViewerId(10)
+            }
+        );
+    }
+
+    #[test]
+    fn test_host_to_server_signal_to_viewer_serialization_and_deserialization() {
+        let msg = HostToServer::SignalToViewer {
+            to: ViewerId(99),
+            message: SignalMessage::Answer {
+                sdp: "answer_sdp".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"SignalToViewer","to":99,"message":{"type":"Answer","sdp":"answer_sdp"}}"#
+        );
+
+        let deserialized: HostToServer = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, msg);
+
+        // Testando com ICE candidate contendo campos opcionais
+        let ice_msg = HostToServer::SignalToViewer {
+            to: ViewerId(99),
+            message: SignalMessage::Ice {
+                candidate: "candidate:1".to_string(),
+                sdp_mid: Some("0".to_string()),
+                sdp_mline_index: None,
+                username_fragment: None,
+            },
+        };
+        let ice_json = serde_json::to_string(&ice_msg).unwrap();
+        assert_eq!(
+            ice_json,
+            r#"{"type":"SignalToViewer","to":99,"message":{"type":"Ice","candidate":"candidate:1","sdpMid":"0"}}"#
+        );
+
+        let deserialized_ice: HostToServer = serde_json::from_str(&ice_json).unwrap();
+        assert_eq!(deserialized_ice, ice_msg);
+    }
+
+    #[test]
+    fn test_host_to_server_deserialize_invalid_type() {
+        let json = r#"{"type":"UnknownHostMsg","to":1}"#;
+        assert!(serde_json::from_str::<HostToServer>(json).is_err());
+    }
+
+    #[test]
+    fn test_host_to_server_deserialize_missing_fields() {
+        // Sem message
+        let json_no_message = r#"{"type":"SignalToViewer","to":99}"#;
+        assert!(serde_json::from_str::<HostToServer>(json_no_message).is_err());
+
+        // Sem to
+        let json_no_to = r#"{"type":"SignalToViewer","message":{"type":"Offer","sdp":"test"}}"#;
+        assert!(serde_json::from_str::<HostToServer>(json_no_to).is_err());
+
+        // Sem a tag type
+        let json_no_type = r#"{"to":99,"message":{"type":"Offer","sdp":"test"}}"#;
+        assert!(serde_json::from_str::<HostToServer>(json_no_type).is_err());
+    }
+
+    #[test]
+    fn test_host_to_server_deserialize_ignores_unknown_fields() {
+        let json = r#"{"type":"SignalToViewer","to":99,"message":{"type":"Offer","sdp":"test"},"extra":42}"#;
+        let deserialized: HostToServer = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            deserialized,
+            HostToServer::SignalToViewer {
+                to: ViewerId(99),
+                message: SignalMessage::Offer {
+                    sdp: "test".to_string()
+                }
             }
         );
     }
