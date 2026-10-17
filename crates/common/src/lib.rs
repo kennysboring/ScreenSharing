@@ -83,7 +83,7 @@ pub enum ViewerToServer {
 )]
 pub enum ServerToViewer {
     SignalFromHost { message: SignalMessage },
-    HostUnavailable, //todo Offer recebido fecha o pc anterior (se existir) e cria um novo
+    HostUnavailable,
 }
 
 #[cfg(test)]
