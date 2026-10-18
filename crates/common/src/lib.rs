@@ -27,7 +27,7 @@ pub enum SignalMessage {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub struct ViewerId(pub u32);
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
@@ -84,6 +84,13 @@ pub enum ViewerToServer {
 pub enum ServerToViewer {
     SignalFromHost { message: SignalMessage },
     HostUnavailable,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRoomResponse {
+    pub room_id: String,
+    pub host_token: String,
 }
 
 #[cfg(test)]
@@ -520,5 +527,50 @@ mod tests {
         let json = r#"{"type":"hostUnavailable","reason":"host disconnected"}"#;
         let deserialized: ServerToViewer = serde_json::from_str(json).unwrap();
         assert_eq!(deserialized, ServerToViewer::HostUnavailable);
+    }
+
+    #[test]
+    fn test_create_room_response_roundtrip() {
+        let response = CreateRoomResponse {
+            room_id: "room-abc-123".to_string(),
+            host_token: "secret-token-456".to_string(),
+        };
+
+        let json =
+            serde_json::to_string(&response).expect("falha ao serializar CreateRoomResponse");
+        let deserialized: CreateRoomResponse =
+            serde_json::from_str(&json).expect("falha ao desserializar CreateRoomResponse");
+
+        assert_eq!(deserialized, response);
+    }
+
+    #[test]
+    fn test_create_room_response_exact_json() {
+        let response = CreateRoomResponse {
+            room_id: "room-abc-123".to_string(),
+            host_token: "secret-token-456".to_string(),
+        };
+
+        let json =
+            serde_json::to_string(&response).expect("falha ao serializar CreateRoomResponse");
+        // Verifica o JSON exato com roomId e hostToken na ordem de declaração dos campos
+        assert_eq!(
+            json,
+            r#"{"roomId":"room-abc-123","hostToken":"secret-token-456"}"#
+        );
+
+        let deserialized: CreateRoomResponse =
+            serde_json::from_str(r#"{"roomId":"room-abc-123","hostToken":"secret-token-456"}"#)
+                .expect("falha ao desserializar JSON exato");
+        assert_eq!(deserialized, response);
+    }
+
+    #[test]
+    fn test_create_room_response_missing_host_token_fails() {
+        // Sem hostToken obrigatório deve falhar na desserialização
+        let json_without_host_token = r#"{"roomId":"room-abc-123"}"#;
+        let result = serde_json::from_str::<CreateRoomResponse>(json_without_host_token);
+
+        assert!(result.is_err());
     }
 }
