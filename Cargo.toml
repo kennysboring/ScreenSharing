@@ -10,6 +10,6 @@ members = [
 common = { path = "crates/common" }
 serde = {version = "1", features = ["derive"]}
 serde_json = "1"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 tokio = {version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "sync"]}
 uuid = {version = "1.28.0", features = ["v4"]}

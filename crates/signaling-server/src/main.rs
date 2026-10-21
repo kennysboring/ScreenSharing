@@ -1,7 +1,8 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State, WebSocketUpgrade, ws::WebSocket},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    response,
     routing::{get, post},
 };
 use common::{CreateRoomResponse, ServerToHost, ServerToViewer, ViewerId};
@@ -47,10 +48,6 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn ws_host() {
-    todo!()
-}
-
 async fn health_check() -> &'static str {
     "vivo"
 }
@@ -88,6 +85,32 @@ async fn create_room(
     } // .lock out
 
     Ok(Json(response))
+}
+
+async fn ws_host(
+    Path(room_id): Path<String>,
+    State(state): State<SharedState>,
+    header: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<response::Response, StatusCode> {
+    let token = extract_token(&header).ok_or(StatusCode::UNAUTHORIZED)?;
+
+    {
+        // .lock in
+        let guard = state.lock().unwrap();
+
+        let room = guard.0.get(&room_id).ok_or(StatusCode::NOT_FOUND)?;
+
+        if room.host_token != token {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    } // .lock out
+
+    Ok(ws.on_upgrade(web_socket_upgrade))
+}
+
+async fn web_socket_upgrade(_socket: WebSocket) {
+    println!("WebSocket estabelecido");
 }
 
 fn extract_token(headers: &HeaderMap) -> Option<Uuid> {
