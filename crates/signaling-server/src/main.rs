@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
 };
 use common::{CreateRoomResponse, ServerToHost, ServerToViewer, ViewerId};
@@ -39,11 +39,16 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/rooms", post(create_room))
+        .route("/ws/host/{room_id}", get(ws_host))
         .with_state(mutex);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
 
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn ws_host() {
+    todo!()
 }
 
 async fn health_check() -> &'static str {
@@ -83,4 +88,103 @@ async fn create_room(
     } // .lock out
 
     Ok(Json(response))
+}
+
+fn extract_token(headers: &HeaderMap) -> Option<Uuid> {
+    let authorization = headers.get(AUTHORIZATION)?;
+    let string = authorization.to_str().ok()?.strip_prefix("Bearer ")?;
+    Uuid::parse_str(string).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn test_extract_token_valid_bearer() {
+        let mut headers = HeaderMap::new();
+        let valid_token = Uuid::new_v4();
+
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {valid_token}")).unwrap(),
+        );
+
+        assert_eq!(extract_token(&headers), Some(valid_token));
+    }
+
+    #[test]
+    fn test_extract_token_missing_bearer_prefix() {
+        let mut headers = HeaderMap::new();
+        let valid_token = Uuid::new_v4();
+
+        // Envia apenas o UUID sem o prefixo "Bearer "
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&valid_token.to_string()).unwrap(),
+        );
+
+        assert_eq!(extract_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_token_invalid_uuid_after_bearer() {
+        let mut headers = HeaderMap::new();
+
+        // Prefixo "Bearer " correto, mas conteúdo não é um UUID válido
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer lixo-invalido-123"),
+        );
+
+        assert_eq!(extract_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_token_missing_header() {
+        // HeaderMap completamente vazio (sem Authorization)
+        let headers = HeaderMap::new();
+
+        assert_eq!(extract_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_token_bearer_without_token() {
+        let mut headers = HeaderMap::new();
+
+        // "Bearer " com espaço mas sem token
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer "));
+        assert_eq!(extract_token(&headers), None);
+
+        // Apenas "Bearer" sem espaço nem token
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer"));
+        assert_eq!(extract_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_token_lowercase_bearer() {
+        let mut headers = HeaderMap::new();
+        let valid_token = Uuid::new_v4();
+
+        // "bearer " em minúsculas (a implementação atual exige "Bearer " com B maiúsculo)
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("bearer {valid_token}")).unwrap(),
+        );
+
+        assert_eq!(extract_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_token_non_ascii_header_value() {
+        let mut headers = HeaderMap::new();
+
+        // Bytes arbitrários não-ASCII fazem authorization.to_str() retornar Err
+        let non_ascii_bytes = b"Bearer \xFF\xFE\xFD";
+        let invalid_header = HeaderValue::from_bytes(non_ascii_bytes).unwrap();
+        headers.insert(AUTHORIZATION, invalid_header);
+
+        assert_eq!(extract_token(&headers), None);
+    }
 }
