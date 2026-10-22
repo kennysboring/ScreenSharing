@@ -1,20 +1,28 @@
 use axum::{
     Json, Router,
-    extract::{Path, State, WebSocketUpgrade, ws::WebSocket},
+    extract::{
+        Path, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response,
     routing::{get, post},
 };
-use common::{CreateRoomResponse, ServerToHost, ServerToViewer, ViewerId};
+use common::{CreateRoomResponse, HostToServer, ServerToHost, ServerToViewer, ViewerId};
+use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, Receiver, channel};
 use uuid::Uuid;
 
+struct Host {
+    id: Uuid,
+    sender: Sender<ServerToHost>,
+}
 struct Room {
-    host: Option<Sender<ServerToHost>>,
+    host: Option<Host>,
     viewers: HashMap<ViewerId, Sender<ServerToViewer>>,
     next_viewer_id: u32,
     host_token: Uuid,
@@ -52,7 +60,7 @@ async fn health_check() -> &'static str {
     "vivo"
 }
 
-const LIMIT_USERS: usize = 10;
+const MAX_ROOMS: usize = 10;
 
 async fn create_room(
     State(state): State<SharedState>,
@@ -69,7 +77,7 @@ async fn create_room(
         // .lock in
         let mut guard = state.lock().unwrap();
 
-        if guard.0.len() == LIMIT_USERS {
+        if guard.0.len() >= MAX_ROOMS {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
 
@@ -87,6 +95,9 @@ async fn create_room(
     Ok(Json(response))
 }
 
+const CAPACITY_CHANNEL: usize = 32;
+const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+
 async fn ws_host(
     Path(room_id): Path<String>,
     State(state): State<SharedState>,
@@ -95,22 +106,74 @@ async fn ws_host(
 ) -> Result<response::Response, StatusCode> {
     let token = extract_token(&header).ok_or(StatusCode::UNAUTHORIZED)?;
 
-    {
+    let (receiver, id) = {
         // .lock in
-        let guard = state.lock().unwrap();
+        let mut guard = state.lock().unwrap();
 
-        let room = guard.0.get(&room_id).ok_or(StatusCode::NOT_FOUND)?;
+        let room = guard.0.get_mut(&room_id).ok_or(StatusCode::NOT_FOUND)?;
 
         if room.host_token != token {
             return Err(StatusCode::UNAUTHORIZED);
         }
-    } // .lock out
 
-    Ok(ws.on_upgrade(web_socket_upgrade))
+        let (sender, receiver) = channel::<ServerToHost>(CAPACITY_CHANNEL);
+
+        let id = Uuid::new_v4();
+        room.host = Some(Host { id, sender });
+        (receiver, id)
+    }; // .lock out
+
+    Ok(ws
+        .max_message_size(MAX_MESSAGE_SIZE)
+        .on_upgrade(move |socket| web_socket_upgrade(socket, receiver, id, state, room_id)))
 }
 
-async fn web_socket_upgrade(_socket: WebSocket) {
+async fn web_socket_upgrade(
+    socket: WebSocket,
+    mut receiver: Receiver<ServerToHost>,
+    id_host: Uuid,
+    state: SharedState,
+    room_id: String,
+) {
     println!("WebSocket estabelecido");
+
+    let (mut sink, mut stream) = socket.split();
+
+    loop {
+        tokio::select! {
+            ws_receiver = receiver.recv() => {
+                match ws_receiver {
+                    Some(msg) => {
+                        let Ok(serialize) = serde_json::to_string(&msg) else { break; };
+                        let Ok(_) = sink.send(Message::Text(serialize.into())).await else { break; };
+                    },
+                    None => break,
+                }
+            },
+            ws_stream = stream.next() => {
+                match ws_stream {
+                    Some(Ok(Message::Text(msg))) => {
+                        let Ok(_) = serde_json::from_str::<HostToServer>(&msg) else { break; };
+                    },
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Err(_)) => break,
+                    None => break,
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    { // .lock in
+        let mut guard = state.lock().unwrap();
+
+        if let Some(room) = guard.0.get_mut(&room_id) {        
+            if matches!(&room.host, Some(host) if host.id == id_host) {
+                room.host = None;
+            }
+        }
+
+    } // .lock out
 }
 
 fn extract_token(headers: &HeaderMap) -> Option<Uuid> {
