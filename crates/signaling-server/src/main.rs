@@ -13,8 +13,9 @@ use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
-use tokio::sync::mpsc::{Sender, Receiver, channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use uuid::Uuid;
 
 struct Host {
@@ -22,10 +23,11 @@ struct Host {
     sender: Sender<ServerToHost>,
 }
 struct Room {
-    host: Option<Host>,
     viewers: HashMap<ViewerId, Sender<ServerToViewer>>,
     next_viewer_id: u32,
+    host: Option<Host>,
     host_token: Uuid,
+    host_absent_since: Option<Instant>,
 }
 
 struct AllRooms(HashMap<String, Room>);
@@ -60,6 +62,8 @@ async fn health_check() -> &'static str {
     "vivo"
 }
 
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const HOST_ABSENCE_GRACE: Duration = Duration::from_secs(180);
 const MAX_ROOMS: usize = 10;
 
 async fn create_room(
@@ -84,15 +88,23 @@ async fn create_room(
         guard.0.insert(
             room_id,
             Room {
-                host: None,
                 viewers: HashMap::new(),
                 next_viewer_id: 0,
+                host: None,
                 host_token,
+                host_absent_since: Some(Instant::now()),
             },
         );
     } // .lock out
 
     Ok(Json(response))
+}
+
+fn remove_expired_rooms(rooms: &mut HashMap<String, Room>, now: Instant, limit: Duration) {
+    rooms.retain(|_id, room| match room.host_absent_since {
+        Some(time) => now.saturating_duration_since(time) < limit,
+        None => true,
+    });
 }
 
 const CAPACITY_CHANNEL: usize = 32;
@@ -108,6 +120,7 @@ async fn ws_host(
 
     let (receiver, id) = {
         // .lock in
+
         let mut guard = state.lock().unwrap();
 
         let room = guard.0.get_mut(&room_id).ok_or(StatusCode::NOT_FOUND)?;
@@ -120,6 +133,7 @@ async fn ws_host(
 
         let id = Uuid::new_v4();
         room.host = Some(Host { id, sender });
+        room.host_absent_since = None;
         (receiver, id)
     }; // .lock out
 
@@ -164,15 +178,16 @@ async fn web_socket_upgrade(
         }
     }
 
-    { // .lock in
+    {
+        // .lock in
         let mut guard = state.lock().unwrap();
 
-        if let Some(room) = guard.0.get_mut(&room_id) {        
+        if let Some(room) = guard.0.get_mut(&room_id) {
             if matches!(&room.host, Some(host) if host.id == id_host) {
                 room.host = None;
+                room.host_absent_since = Some(Instant::now());
             }
         }
-
     } // .lock out
 }
 
@@ -272,5 +287,109 @@ mod tests {
         headers.insert(AUTHORIZATION, invalid_header);
 
         assert_eq!(extract_token(&headers), None);
+    }
+
+    fn room_with(host_absent_since: Option<Instant>) -> Room {
+        Room {
+            viewers: HashMap::new(),
+            next_viewer_id: 0,
+            host: None,
+            host_token: Uuid::new_v4(),
+            host_absent_since,
+        }
+    }
+
+    #[test]
+    fn test_remove_expired_rooms_absent_beyond_grace() {
+        let mut rooms = HashMap::new();
+        let desde = Instant::now();
+        let grace = HOST_ABSENCE_GRACE;
+
+        rooms.insert("room1".to_string(), room_with(Some(desde)));
+
+        // Ausente além da tolerância (1 segundo a mais)
+        let now = desde + grace + Duration::from_secs(1);
+        remove_expired_rooms(&mut rooms, now, grace);
+
+        assert!(rooms.is_empty());
+    }
+
+    #[test]
+    fn test_remove_expired_rooms_absent_within_grace() {
+        let mut rooms = HashMap::new();
+        let desde = Instant::now();
+        let grace = HOST_ABSENCE_GRACE;
+
+        rooms.insert("room1".to_string(), room_with(Some(desde)));
+
+        // Ausente menos que a tolerância
+        let now = desde + Duration::from_secs(100);
+        remove_expired_rooms(&mut rooms, now, grace);
+
+        assert_eq!(rooms.len(), 1);
+        assert!(rooms.contains_key("room1"));
+    }
+
+    #[test]
+    fn test_remove_expired_rooms_host_present() {
+        let mut rooms = HashMap::new();
+        let desde = Instant::now();
+        let grace = HOST_ABSENCE_GRACE;
+
+        // Host presente (host_absent_since = None)
+        rooms.insert("room1".to_string(), room_with(None));
+
+        // Mesmo com `now` muito no futuro (ex: 100 horas depois)
+        let now = desde + Duration::from_secs(360_000);
+        remove_expired_rooms(&mut rooms, now, grace);
+
+        assert_eq!(rooms.len(), 1);
+        assert!(rooms.contains_key("room1"));
+    }
+
+    #[test]
+    fn test_remove_expired_rooms_exact_boundary_and_transition() {
+        let mut rooms = HashMap::new();
+        let desde = Instant::now();
+        let grace = HOST_ABSENCE_GRACE;
+
+        // 1. Instante imediatamente anterior à tolerância (now = desde + grace - 1 ns): deve manter
+        rooms.insert("room1".to_string(), room_with(Some(desde)));
+        let now_before = desde + grace - Duration::from_nanos(1);
+        remove_expired_rooms(&mut rooms, now_before, grace);
+        assert_eq!(
+            rooms.len(),
+            1,
+            "A sala deveria ser mantida 1ns antes de atingir a tolerância exata"
+        );
+
+        // 2. Fronteira exata (now = desde + grace): com '<', o delta é igual ao limit, resultando em false -> removida
+        let now_exact = desde + grace;
+        remove_expired_rooms(&mut rooms, now_exact, grace);
+        assert!(
+            rooms.is_empty(),
+            "A sala deveria ser removida no instante exato da tolerância (now == desde + grace)"
+        );
+    }
+
+    #[test]
+    fn test_remove_expired_rooms_isolates_expired_entry() {
+        let mut rooms = HashMap::new();
+        let desde = Instant::now();
+        let grace = HOST_ABSENCE_GRACE;
+
+        // Sala 1: ausente desde 'desde' (vai expirar no tempo 'now')
+        rooms.insert("expired_room".to_string(), room_with(Some(desde)));
+
+        // Sala 2: ausente mais recentemente (permanecerá válida)
+        let recente = desde + Duration::from_secs(100);
+        rooms.insert("valid_room".to_string(), room_with(Some(recente)));
+
+        let now = desde + grace;
+        remove_expired_rooms(&mut rooms, now, grace);
+
+        assert_eq!(rooms.len(), 1);
+        assert!(rooms.contains_key("valid_room"));
+        assert!(!rooms.contains_key("expired_room"));
     }
 }
