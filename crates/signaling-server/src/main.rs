@@ -15,7 +15,10 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::{
+    sync::mpsc::{Receiver, Sender, channel},
+    time,
+};
 use uuid::Uuid;
 
 struct Host {
@@ -43,9 +46,27 @@ struct Connection {
 
 type SharedState = Arc<Mutex<AllRooms>>;
 
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const HOST_ABSENCE_GRACE: Duration = Duration::from_secs(180);
+
 #[tokio::main]
 async fn main() {
     let mutex: SharedState = Arc::new(Mutex::new(AllRooms(HashMap::new())));
+    let mutex_clone = Arc::clone(&mutex);
+
+    tokio::spawn(async move {
+        let mut timer = time::interval(SWEEP_INTERVAL);
+
+        loop {
+            timer.tick().await;
+            {
+                // .lock() in
+                let mut guard = mutex_clone.lock().unwrap();
+
+                remove_expired_rooms(&mut guard.0, Instant::now(), HOST_ABSENCE_GRACE);
+            } // .lock() out
+        }
+    });
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -62,8 +83,6 @@ async fn health_check() -> &'static str {
     "vivo"
 }
 
-const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-const HOST_ABSENCE_GRACE: Duration = Duration::from_secs(180);
 const MAX_ROOMS: usize = 10;
 
 async fn create_room(
