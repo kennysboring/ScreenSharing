@@ -5,10 +5,13 @@ use axum::{
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
-    response,
+    response::{self, Response},
     routing::{get, post},
 };
-use common::{CreateRoomResponse, HostToServer, ServerToHost, ServerToViewer, ViewerId};
+use common::{
+    CreateRoomResponse, HostToServer, ServerToHost, ServerToViewer, SignalMessage, ViewerId,
+    ViewerToServer,
+};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
@@ -16,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::mpsc::{Receiver, Sender, channel, error::TrySendError},
     time,
 };
 use uuid::Uuid;
@@ -34,15 +37,6 @@ struct Room {
 }
 
 struct AllRooms(HashMap<String, Room>);
-
-enum UserType {
-    Host,
-    Viewer(ViewerId),
-}
-struct Connection {
-    room_id: String,
-    user_type: UserType,
-}
 
 type SharedState = Arc<Mutex<AllRooms>>;
 
@@ -72,6 +66,7 @@ async fn main() {
         .route("/health", get(health_check))
         .route("/rooms", post(create_room))
         .route("/ws/host/{room_id}", get(ws_host))
+        .route("/ws/viewer/{room_id}", get(ws_viewer))
         .with_state(mutex);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -214,6 +209,137 @@ fn extract_token(headers: &HeaderMap) -> Option<Uuid> {
     let authorization = headers.get(AUTHORIZATION)?;
     let string = authorization.to_str().ok()?.strip_prefix("Bearer ")?;
     Uuid::parse_str(string).ok()
+}
+
+const MAX_VIEWERS_PER_ROOM: usize = 5;
+
+async fn ws_viewer(
+    Path(room_id): Path<String>,
+    State(state): State<SharedState>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, StatusCode> {
+    let (receiver, id) = {
+        // .lock in
+
+        let mut guard = state.lock().unwrap();
+
+        let room = guard.0.get_mut(&room_id).ok_or(StatusCode::NOT_FOUND)?;
+
+        if room.viewers.len() >= MAX_VIEWERS_PER_ROOM {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        let (sender, receiver) = channel::<ServerToViewer>(CAPACITY_CHANNEL);
+
+        let id = ViewerId(room.next_viewer_id);
+        if let Some(host) = &room.host {
+            if host
+                .sender
+                .try_send(ServerToHost::ViewerJoined { viewer_id: id })
+                .is_err()
+            {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            };
+        } else {
+            let _ = sender.try_send(ServerToViewer::HostUnavailable);
+        }
+
+        room.viewers.insert(id, sender);
+        room.next_viewer_id += 1;
+        (receiver, id)
+    }; // .lock out
+
+    let body = ws
+        .max_message_size(MAX_MESSAGE_SIZE)
+        .on_upgrade(move |socket| web_socket_upgrade_viewer(socket, receiver, id, state, room_id));
+
+    Ok(body)
+}
+
+async fn web_socket_upgrade_viewer(
+    socket: WebSocket,
+    mut receiver: Receiver<ServerToViewer>,
+    id: ViewerId,
+    state: SharedState,
+    room_id: String,
+) {
+    println!("viewer conectou");
+
+    let (mut sink, mut stream) = socket.split();
+
+    loop {
+        tokio::select! {
+            ws_receiver = receiver.recv() => {
+                match ws_receiver {
+                    Some(msg) => {
+                        let Ok(serialize) = serde_json::to_string(&msg) else { break; };
+                        let Ok(_) = sink.send(Message::Text(serialize.into())).await else { break; };
+                    },
+                    None => break,
+                }
+            },
+            ws_stream = stream.next() => {
+                match ws_stream {
+                    Some(Ok(Message::Text(msg))) => if !handle_viewer_message(&msg, &state, &room_id, id) {break;},
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Err(_)) => break,
+                    None => break,
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    remove_viewer(&state, &room_id, id);
+}
+
+fn remove_viewer(state: &SharedState, room_id: &str, id: ViewerId) {
+    {
+        // .lock in
+        let mut guard = state.lock().unwrap();
+
+        if let Some(room) = guard.0.get_mut(room_id) {
+            if room.viewers.remove(&id).is_some() {
+                if let Some(host) = &room.host {
+                    let _ = host
+                        .sender
+                        .try_send(ServerToHost::ViewerLeft { viewer_id: id });
+                }
+            }
+        }
+    } // .lock out
+}
+
+fn handle_viewer_message(msg: &str, state: &SharedState, room_id: &str, id: ViewerId) -> bool {
+    let signal_message = match serde_json::from_str::<ViewerToServer>(msg) {
+        Ok(ViewerToServer::SignalToHost { message }) => match message {
+            SignalMessage::Answer { .. } | SignalMessage::Ice { .. } => message,
+            SignalMessage::Offer { .. } => return false,
+        },
+        Err(_) => return false,
+    };
+
+    {
+        // .lock in
+        let guard = state.lock().unwrap();
+
+        let Some(room) = guard.0.get(room_id) else {
+            return true;
+        };
+        let Some(host) = &room.host else { return true };
+
+        let server_message = ServerToHost::SignalFromViewer {
+            from: id,
+            message: signal_message,
+        };
+
+        match host.sender.try_send(server_message) {
+            Ok(_) => {}
+            Err(TrySendError::Full(_)) => return false,
+            Err(TrySendError::Closed(_)) => return true,
+        }
+    } // .lock out
+    true
 }
 
 #[cfg(test)]
