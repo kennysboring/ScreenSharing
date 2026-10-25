@@ -142,12 +142,7 @@ async fn ws_host(
             return Err(StatusCode::UNAUTHORIZED);
         }
 
-        let (sender, receiver) = channel::<ServerToHost>(CAPACITY_CHANNEL);
-
-        let id = Uuid::new_v4();
-        room.host = Some(Host { id, sender });
-        room.host_absent_since = None;
-        (receiver, id)
+        register_host(room)
     }; // .lock out
 
     Ok(ws
@@ -372,6 +367,25 @@ fn handle_host_message(msg: &str, state: &SharedState, room_id: &str, id_host: U
 
     remove_viewer(state, room_id, to);
     true
+}
+
+fn register_host(room: &mut Room) -> (Receiver<ServerToHost>, Uuid) {
+
+    let id = Uuid::new_v4();
+    let (sender, receiver) = channel::<ServerToHost>(CAPACITY_CHANNEL);
+
+    let mut viewers: Vec<ViewerId> = room.viewers.keys().copied().collect();
+    viewers.sort_by_key(|v| v.0);
+
+    let _ = sender.try_send(ServerToHost::ViewerList { viewers });
+
+    room.host = Some(Host { id, sender });
+    room.host_absent_since = None;
+    (receiver, id)
+}
+
+fn unregister_host(room: &mut Room, id_host: Uuid, now: Instant) {
+
 }
 
 #[cfg(test)]
@@ -735,5 +749,83 @@ mod tests {
         assert!(result);
         assert!(viewer_rx.try_recv().is_err());
         assert!(host_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_register_host_with_viewers() {
+        let mut room = room_with(None);
+
+        // Insere cinco viewers (0 a 4). Como a ordem de iteração do HashMap é não determinística,
+        // uma amostra com 5 elementos reduz a chance de ordenação acidental a 1 em 120 (1/5!).
+        for id in [3, 0, 4, 1, 2] {
+            let (tx, _rx) = channel(1);
+            room.viewers.insert(ViewerId(id), tx);
+        }
+
+        let (mut rx, _id) = register_host(&mut room);
+
+        let msg = rx.try_recv().expect("deve receber ViewerList");
+        assert_eq!(
+            msg,
+            ServerToHost::ViewerList {
+                viewers: vec![
+                    ViewerId(0),
+                    ViewerId(1),
+                    ViewerId(2),
+                    ViewerId(3),
+                    ViewerId(4),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_register_host_empty_viewers() {
+        let mut room = room_with(None);
+
+        let (mut rx, _id) = register_host(&mut room);
+
+        let msg = rx.try_recv().expect("deve receber ViewerList vazia");
+        assert_eq!(
+            msg,
+            ServerToHost::ViewerList {
+                viewers: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn test_register_host_state() {
+        // Começa com Some(Instant::now()) para provar que a função o zera
+        let mut room = room_with(Some(Instant::now()));
+        assert!(room.host.is_none());
+        assert!(room.host_absent_since.is_some());
+
+        let (_rx, id) = register_host(&mut room);
+
+        assert!(matches!(&room.host, Some(h) if h.id == id));
+        assert_eq!(room.host_absent_since, None);
+    }
+
+    #[test]
+    fn test_register_host_replacement() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let mut room = room_with(None);
+
+        let (mut rx1, id1) = register_host(&mut room);
+        let (_rx2, id2) = register_host(&mut room);
+
+        assert_ne!(id1, id2);
+        assert!(matches!(&room.host, Some(h) if h.id == id2));
+
+        // O primeiro receptor ainda entrega a mensagem que estava na fila
+        let msg = rx1
+            .try_recv()
+            .expect("primeiro receptor deve entregar mensagem na fila");
+        assert_eq!(msg, ServerToHost::ViewerList { viewers: vec![] });
+
+        // E só depois devolve TryRecvError::Disconnected porque o sender antigo foi dropado
+        assert_eq!(rx1.try_recv(), Err(TryRecvError::Disconnected));
     }
 }
