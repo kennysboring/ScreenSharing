@@ -9,8 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use common::{
-    CreateRoomResponse, HostToServer, ServerToHost, ServerToViewer, SignalMessage, ViewerId,
-    ViewerToServer,
+    CreateRoomResponse, HostToServer, ServerToHost, ServerToViewer, SignalMessage, ViewerId, ViewerToServer,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -180,13 +179,12 @@ async fn web_socket_upgrade(
             },
             ws_stream = stream.next() => {
                 match ws_stream {
-                    Some(Ok(Message::Text(msg))) => {
-                        let Ok(_) = serde_json::from_str::<HostToServer>(&msg) else { break; };
-                    },
+                    Some(Ok(Message::Text(msg))) => if !handle_host_message(&msg, &state, &room_id, id_host) { break; },
                     Some(Ok(Message::Close(_))) => break,
                     Some(Err(_)) => break,
                     None => break,
                     _ => continue,
+                
                 }
             }
         }
@@ -339,6 +337,40 @@ fn handle_viewer_message(msg: &str, state: &SharedState, room_id: &str, id: View
             Err(TrySendError::Closed(_)) => return true,
         }
     } // .lock out
+    true
+}
+
+fn handle_host_message(msg: &str, state: &SharedState, room_id: &str, id_host: Uuid) -> bool {
+    let (to , signal_message) = match serde_json::from_str::<HostToServer>(msg) {
+        Ok(HostToServer::SignalToViewer { to, message } ) => match message {
+            SignalMessage::Offer { .. } | SignalMessage::Ice { .. } => (to, message),
+            SignalMessage::Answer { .. } => return false,
+        },
+        Err(_) => return false,
+    };
+
+    {
+        // .lock in
+        let guard = state.lock().unwrap();
+
+        let Some(room) = guard.0.get(room_id) else {
+            return true;
+        };
+
+        if !matches!(&room.host, Some(h) if h.id == id_host){return false;}
+
+        let Some(viewer) = room.viewers.get(&to) else { return true };
+
+        let server_message = ServerToViewer::SignalFromHost { message: signal_message };
+
+        match viewer.try_send(server_message) {
+            Ok(_) => return true,
+            Err(TrySendError::Full(_)) => {},
+            Err(TrySendError::Closed(_)) => return true,
+        }
+    } // .lock out
+
+    remove_viewer(state, room_id, to);
     true
 }
 
@@ -536,5 +568,172 @@ mod tests {
         assert_eq!(rooms.len(), 1);
         assert!(rooms.contains_key("valid_room"));
         assert!(!rooms.contains_key("expired_room"));
+    }
+
+    fn room_with_channels(
+        host_id: Uuid,
+        host_sender: Sender<ServerToHost>,
+        viewer_sender: Sender<ServerToViewer>,
+    ) -> SharedState {
+        let mut viewers = HashMap::new();
+        viewers.insert(ViewerId(0), viewer_sender);
+
+        let room = Room {
+            viewers,
+            next_viewer_id: 1,
+            host: Some(Host {
+                id: host_id,
+                sender: host_sender,
+            }),
+            host_token: Uuid::new_v4(),
+            host_absent_since: None,
+        };
+
+        let mut rooms = HashMap::new();
+        rooms.insert("room".to_string(), room);
+        Arc::new(Mutex::new(AllRooms(rooms)))
+    }
+
+    #[test]
+    fn test_handle_host_message_normal_forwarding() {
+        let host_id = Uuid::new_v4();
+        let (host_tx, mut host_rx) = channel::<ServerToHost>(8);
+        let (viewer_tx, mut viewer_rx) = channel::<ServerToViewer>(1);
+        let state = room_with_channels(host_id, host_tx, viewer_tx);
+
+        let json = r#"{"type":"signalToViewer","to":0,"message":{"type":"offer","sdp":"x"}}"#;
+        let result = handle_host_message(json, &state, "room", host_id);
+
+        assert!(result);
+        let received = viewer_rx.try_recv().expect("viewer should receive message");
+        assert_eq!(
+            received,
+            ServerToViewer::SignalFromHost {
+                message: SignalMessage::Offer {
+                    sdp: "x".to_string(),
+                }
+            }
+        );
+        assert!(host_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_handle_host_message_answer_rejected() {
+        let host_id = Uuid::new_v4();
+        let (host_tx, mut host_rx) = channel::<ServerToHost>(8);
+        let (viewer_tx, mut viewer_rx) = channel::<ServerToViewer>(1);
+        let state = room_with_channels(host_id, host_tx, viewer_tx);
+
+        let json = r#"{"type":"signalToViewer","to":0,"message":{"type":"answer","sdp":"x"}}"#;
+        let result = handle_host_message(json, &state, "room", host_id);
+
+        assert!(!result);
+        assert!(viewer_rx.try_recv().is_err());
+        assert!(host_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_handle_host_message_invalid_json() {
+        let host_id = Uuid::new_v4();
+        let (host_tx, mut host_rx) = channel::<ServerToHost>(8);
+        let (viewer_tx, mut viewer_rx) = channel::<ServerToViewer>(1);
+        let state = room_with_channels(host_id, host_tx, viewer_tx);
+
+        let json = "invalid_json";
+        let result = handle_host_message(json, &state, "room", host_id);
+
+        assert!(!result);
+        assert!(viewer_rx.try_recv().is_err());
+        assert!(host_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_handle_host_message_nonexistent_viewer() {
+        let host_id = Uuid::new_v4();
+        let (host_tx, mut host_rx) = channel::<ServerToHost>(8);
+        let (viewer_tx, mut viewer_rx) = channel::<ServerToViewer>(1);
+        let state = room_with_channels(host_id, host_tx, viewer_tx);
+
+        let json = r#"{"type":"signalToViewer","to":99,"message":{"type":"offer","sdp":"x"}}"#;
+        let result = handle_host_message(json, &state, "room", host_id);
+
+        assert!(result);
+        assert!(viewer_rx.try_recv().is_err());
+        assert!(host_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_handle_host_message_replaced_host() {
+        let host_id = Uuid::new_v4();
+        let different_host_id = Uuid::new_v4();
+        let (host_tx, mut host_rx) = channel::<ServerToHost>(8);
+        let (viewer_tx, mut viewer_rx) = channel::<ServerToViewer>(1);
+        let state = room_with_channels(host_id, host_tx, viewer_tx);
+
+        let json = r#"{"type":"signalToViewer","to":0,"message":{"type":"offer","sdp":"x"}}"#;
+        let result = handle_host_message(json, &state, "room", different_host_id);
+
+        assert!(!result);
+        assert!(viewer_rx.try_recv().is_err());
+        assert!(host_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_handle_host_message_viewer_channel_full() {
+        let host_id = Uuid::new_v4();
+        let (host_tx, mut host_rx) = channel::<ServerToHost>(8);
+        let (viewer_tx, mut viewer_rx) = channel::<ServerToViewer>(1);
+
+        // Enche o canal antes de entregar o Sender à sala
+        viewer_tx
+            .try_send(ServerToViewer::HostUnavailable)
+            .expect("should fill viewer channel");
+
+        let state = room_with_channels(host_id, host_tx, viewer_tx);
+
+        let json = r#"{"type":"signalToViewer","to":0,"message":{"type":"offer","sdp":"x"}}"#;
+        let result = handle_host_message(json, &state, "room", host_id);
+
+        assert!(result);
+
+        // Verifica que o mapa de viewers está vazio (em escopo curto)
+        {
+            let guard = state.lock().unwrap();
+            let room = guard.0.get("room").expect("room should exist");
+            assert!(room.viewers.is_empty(), "viewer should have been removed");
+        }
+
+        // Host recebe ViewerLeft { viewer_id: ViewerId(0) }
+        let host_msg = host_rx
+            .try_recv()
+            .expect("host should receive ViewerLeft notification");
+        assert_eq!(
+            host_msg,
+            ServerToHost::ViewerLeft {
+                viewer_id: ViewerId(0)
+            }
+        );
+
+        // Canal do viewer continha a mensagem inicial com que foi preenchido
+        assert_eq!(
+            viewer_rx.try_recv().unwrap(),
+            ServerToViewer::HostUnavailable
+        );
+        assert!(viewer_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_handle_host_message_nonexistent_room() {
+        let host_id = Uuid::new_v4();
+        let (host_tx, mut host_rx) = channel::<ServerToHost>(8);
+        let (viewer_tx, mut viewer_rx) = channel::<ServerToViewer>(1);
+        let state = room_with_channels(host_id, host_tx, viewer_tx);
+
+        let json = r#"{"type":"signalToViewer","to":0,"message":{"type":"offer","sdp":"x"}}"#;
+        let result = handle_host_message(json, &state, "nonexistent_room", host_id);
+
+        assert!(result);
+        assert!(viewer_rx.try_recv().is_err());
+        assert!(host_rx.try_recv().is_err());
     }
 }
