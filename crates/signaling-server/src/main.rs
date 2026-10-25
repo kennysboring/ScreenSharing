@@ -147,10 +147,10 @@ async fn ws_host(
 
     Ok(ws
         .max_message_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| web_socket_upgrade(socket, receiver, id, state, room_id)))
+        .on_upgrade(move |socket| web_socket_upgrade_host(socket, receiver, id, state, room_id)))
 }
 
-async fn web_socket_upgrade(
+async fn web_socket_upgrade_host(
     socket: WebSocket,
     mut receiver: Receiver<ServerToHost>,
     id_host: Uuid,
@@ -190,10 +190,7 @@ async fn web_socket_upgrade(
         let mut guard = state.lock().unwrap();
 
         if let Some(room) = guard.0.get_mut(&room_id) {
-            if matches!(&room.host, Some(host) if host.id == id_host) {
-                room.host = None;
-                room.host_absent_since = Some(Instant::now());
-            }
+            unregister_host(room, id_host, Instant::now());
         }
     } // .lock out
 }
@@ -385,7 +382,14 @@ fn register_host(room: &mut Room) -> (Receiver<ServerToHost>, Uuid) {
 }
 
 fn unregister_host(room: &mut Room, id_host: Uuid, now: Instant) {
+    if matches!(&room.host, Some(host) if host.id == id_host) {return;}
 
+    room.host = None;
+    room.host_absent_since = Some(now);
+
+    for viewer in room.viewers.values() {
+        let _ = viewer.try_send(ServerToViewer::HostUnavailable);
+    }
 }
 
 #[cfg(test)]
