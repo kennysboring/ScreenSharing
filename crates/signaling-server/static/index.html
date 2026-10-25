@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Viewer de Vídeo</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      background-color: #0e0e10;
+      color: #f1f1f1;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      overflow-x: hidden;
+    }
+    .video-container {
+      position: relative;
+      width: 100vw;
+      max-width: 1280px;
+      aspect-ratio: 16 / 9;
+      background-color: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      background-color: #000;
+    }
+    .status-badge {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(0, 0, 0, 0.65);
+      backdrop-filter: blur(4px);
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      pointer-events: none;
+      z-index: 10;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: #888;
+    }
+    .status-dot.live {
+      background-color: #e53935;
+      box-shadow: 0 0 8px rgba(229, 57, 53, 0.8);
+    }
+    .status-dot.connecting {
+      background-color: #fb8c00;
+    }
+    .status-dot.error {
+      background-color: #d32f2f;
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      margin-top: 16px;
+      padding: 0 16px;
+      width: 100%;
+      max-width: 1280px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    button {
+      background-color: #26262c;
+      color: #efeff1;
+      border: 1px solid #3a3a44;
+      padding: 10px 18px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 44px; /* Otimizado para toque em celular */
+      touch-action: manipulation;
+      transition: background-color 0.15s ease, border-color 0.15s ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+    button:hover {
+      background-color: #32323a;
+      border-color: #4e4e5b;
+    }
+    button:active {
+      background-color: #1f1f23;
+    }
+    @media (max-width: 600px) {
+      .video-container {
+        width: 100vw;
+        border-radius: 0;
+      }
+      .controls {
+        padding: 0 12px;
+      }
+      button {
+        flex: 1;
+        font-size: 13px;
+        padding: 10px 12px;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="video-container" id="videoContainer">
+    <video id="remoteVideo" autoplay muted playsinline></video>
+    <div class="status-badge">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">conectando...</span>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="unmuteBtn" type="button">Ativar Som</button>
+    <button id="fullscreenBtn" type="button">Tela Cheia</button>
+  </div>
+
+  <script>
+    // Configurações WebRTC (adicione servidores TURN aqui no futuro)
+    const ICE_SERVERS = [
+      { urls: 'stun:stun.l.google.com:19302' }
+    ];
+
+    // Elementos da UI
+    const video = document.getElementById('remoteVideo');
+    const videoContainer = document.getElementById('videoContainer');
+    const statusText = document.getElementById('statusText');
+    const statusDot = document.getElementById('statusDot');
+    const unmuteBtn = document.getElementById('unmuteBtn');
+    const fullscreenBtn = document.getElementById('fullscreenBtn');
+
+    // Estado da conexão
+    let ws = null;
+    let pc = null;
+    let remoteStream = null;
+    let iceCandidateQueue = [];
+    let isRemoteDescriptionSet = false;
+    let reconnectDelay = 1000;
+    let reconnectTimeout = null;
+    let hasConnectedOnce = false;
+
+    // Extrai o room_id do último segmento do pathname
+    const pathSegments = window.location.pathname.replace(/\/+$/, '').split('/');
+    const roomId = pathSegments[pathSegments.length - 1] || '';
+
+    function updateStatus(text, type) {
+      statusText.textContent = text;
+      statusDot.className = 'status-dot';
+      if (type === 'live') {
+        statusDot.classList.add('live');
+      } else if (type === 'connecting') {
+        statusDot.classList.add('connecting');
+      } else if (type === 'error') {
+        statusDot.classList.add('error');
+      }
+    }
+
+    function closePeerConnection() {
+      if (pc) {
+        pc.onicecandidate = null;
+        pc.ontrack = null;
+        pc.onconnectionstatechange = null;
+        pc.close();
+        pc = null;
+      }
+      remoteStream = null;
+      iceCandidateQueue = [];
+      isRemoteDescriptionSet = false;
+    }
+
+    function resetVideo() {
+      video.srcObject = null;
+    }
+
+    function createNewPeerConnection() {
+      closePeerConnection();
+
+      try {
+        pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      } catch (err) {
+        updateStatus('erro ao criar peer connection', 'error');
+        return null;
+      }
+
+      pc.onicecandidate = (event) => {
+        // Se event.candidate for null ou candidate for string vazia (fim da coleta em alguns browsers), NÃO envia nada
+        if (event.candidate && event.candidate.candidate && event.candidate.candidate.trim() !== '' && ws && ws.readyState === WebSocket.OPEN) {
+          const candidateJson = event.candidate.toJSON();
+          const message = {
+            type: 'signalToHost',
+            message: {
+              type: 'ice',
+              ...candidateJson
+            }
+          };
+          ws.send(JSON.stringify(message));
+        }
+      };
+
+      pc.ontrack = (event) => {
+        // Não depende de event.streams[0] (evita problemas caso o host não envie msid no SDP)
+        if (!remoteStream) {
+          remoteStream = new MediaStream();
+          video.srcObject = remoteStream;
+        }
+        if (event.track) {
+          remoteStream.addTrack(event.track);
+        }
+        updateStatus('ao vivo', 'live');
+
+        // Tenta minimizar a latência ajustando o jitterBufferTarget do receiver se suportado
+        // (Nota: jitterBufferTarget = 0 pede latência mínima; em rede instável pode-se usar de 50 a 100ms)
+        if (event.receiver && 'jitterBufferTarget' in event.receiver) {
+          try {
+            event.receiver.jitterBufferTarget = 0;
+          } catch (e) {
+            // Ignora se não for suportado pelo navegador
+          }
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (!pc) return;
+        const state = pc.connectionState;
+        if (state === 'connected') {
+          updateStatus('ao vivo', 'live');
+        } else if (state === 'connecting') {
+          updateStatus('conectando...', 'connecting');
+        } else if (state === 'failed') {
+          updateStatus('conexão falhou', 'error');
+        } else if (state === 'disconnected') {
+          updateStatus('desconectado', 'error');
+        }
+      };
+
+      return pc;
+    }
+
+    async function handleOffer(offerSdp) {
+      const peer = createNewPeerConnection();
+      if (!peer) return;
+
+      try {
+        await peer.setRemoteDescription(new RTCSessionDescription({
+          type: 'offer',
+          sdp: offerSdp
+        }));
+        if (peer !== pc) return; // Checagem contra corrida de offers
+        isRemoteDescriptionSet = true;
+
+        // Esvazia e aplica os ICE candidates enfileirados
+        while (iceCandidateQueue.length > 0) {
+          if (peer !== pc) return;
+          const candidate = iceCandidateQueue.shift();
+          try {
+            await peer.addIceCandidate(candidate);
+          } catch (e) {
+            // Ignora falha de candidato específico para não quebrar a conexão
+          }
+        }
+
+        if (peer !== pc) return;
+        const answer = await peer.createAnswer();
+
+        if (peer !== pc) return;
+        await peer.setLocalDescription(answer);
+
+        if (peer !== pc) return;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'signalToHost',
+            message: {
+              type: 'answer',
+              sdp: peer.localDescription.sdp
+            }
+          }));
+        }
+      } catch (err) {
+        if (peer === pc) {
+          updateStatus('erro no WebRTC', 'error');
+        }
+      }
+    }
+
+    async function handleIceCandidate(candidateData) {
+      if (!candidateData || !candidateData.candidate) return;
+
+      const iceInit = {
+        candidate: candidateData.candidate,
+        sdpMid: candidateData.sdpMid ?? null,
+        sdpMLineIndex: candidateData.sdpMLineIndex ?? null,
+        usernameFragment: candidateData.usernameFragment ?? null
+      };
+
+      if (!isRemoteDescriptionSet || !pc) {
+        iceCandidateQueue.push(iceInit);
+      } else {
+        try {
+          await pc.addIceCandidate(iceInit);
+        } catch (err) {
+          // Ignora falha em candidato individual
+        }
+      }
+    }
+
+    function connectWebSocket() {
+      if (!roomId) {
+        updateStatus('sala indisponível', 'error');
+        return;
+      }
+
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+      }
+
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const wsUrl = `${protocol}://${window.location.host}/ws/viewer/${encodeURIComponent(roomId)}`;
+
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch (e) {
+        scheduleReconnect();
+        return;
+      }
+
+      ws.onopen = () => {
+        hasConnectedOnce = true;
+        reconnectDelay = 1000; // Zera a espera ao conectar com sucesso
+        updateStatus('aguardando o host...', 'connecting');
+      };
+
+      ws.onmessage = (event) => {
+        let data;
+        try {
+          data = JSON.parse(event.data);
+        } catch (err) {
+          // Ignora JSON inválido sem quebrar a página
+          return;
+        }
+
+        if (!data || typeof data.type !== 'string') {
+          return;
+        }
+
+        switch (data.type) {
+          case 'hostUnavailable':
+            closePeerConnection();
+            resetVideo();
+            updateStatus('aguardando o host...', 'connecting');
+            break;
+
+          case 'signalFromHost':
+            if (data.message && typeof data.message === 'object') {
+              const signal = data.message;
+              if (signal.type === 'offer' && signal.sdp) {
+                handleOffer(signal.sdp);
+              } else if (signal.type === 'ice') {
+                handleIceCandidate(signal);
+              }
+            }
+            break;
+
+          default:
+            // Tipo desconhecido: ignora silenciosamente
+            break;
+        }
+      };
+
+      ws.onerror = () => {
+        // WebSocket do navegador não expõe status HTTP. Se nunca conectou, indica sala indisponível
+        if (!hasConnectedOnce) {
+          updateStatus('sala indisponível', 'error');
+        }
+      };
+
+      ws.onclose = () => {
+        closePeerConnection();
+        resetVideo();
+        if (!hasConnectedOnce) {
+          updateStatus('sala indisponível', 'error');
+        } else {
+          updateStatus('conectando...', 'connecting');
+        }
+        scheduleReconnect();
+      };
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimeout) return;
+      reconnectTimeout = setTimeout(() => {
+        reconnectTimeout = null;
+        connectWebSocket();
+      }, reconnectDelay);
+
+      // Espera crescente: 1s, 2s, 4s, 8s, 15s (teto em 15s)
+      reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+    }
+
+    // Botão de Áudio (Tirar mudo / Mudo)
+    unmuteBtn.addEventListener('click', () => {
+      if (video.muted) {
+        video.muted = false;
+        video.play().catch(() => {});
+        unmuteBtn.textContent = 'Silenciar';
+      } else {
+        video.muted = true;
+        unmuteBtn.textContent = 'Ativar Som';
+      }
+    });
+
+    // Botão de Tela Cheia
+    fullscreenBtn.addEventListener('click', () => {
+      const target = videoContainer;
+      if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+        if (target.requestFullscreen) {
+          target.requestFullscreen().catch(() => {});
+        } else if (target.webkitRequestFullscreen) {
+          target.webkitRequestFullscreen();
+        } else if (video.webkitEnterFullscreen) {
+          // Suporte para iOS Safari direto no elemento video
+          video.webkitEnterFullscreen();
+        }
+      } else {
+        if (document.exitFullscreen) {
+          document.exitFullscreen().catch(() => {});
+        } else if (document.webkitExitFullscreen) {
+          document.webkitExitFullscreen();
+        }
+      }
+    });
+
+    // Inicia a conexão
+    updateStatus('conectando...', 'connecting');
+    connectWebSocket();
+  </script>
+</body>
+</html>

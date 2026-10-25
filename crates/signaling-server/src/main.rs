@@ -1,12 +1,8 @@
 use axum::{
-    Json, Router,
-    extract::{
+    Json, Router, extract::{
         Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
-    },
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
-    response::{self, Response},
-    routing::{get, post},
+    }, http::{HeaderMap, StatusCode, header::AUTHORIZATION}, response::{self, Html, Response}, routing::{get, post},
 };
 use common::{
     CreateRoomResponse, HostToServer, ServerToHost, ServerToViewer, SignalMessage, ViewerId, ViewerToServer,
@@ -64,6 +60,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/rooms", post(create_room))
+        .route("/room/{room_id}", get(get_html))
         .route("/ws/host/{room_id}", get(ws_host))
         .route("/ws/viewer/{room_id}", get(ws_viewer))
         .with_state(mutex);
@@ -111,6 +108,10 @@ async fn create_room(
     } // .lock out
 
     Ok(Json(response))
+}
+
+async fn get_html() -> axum::response::Html<&'static str>{
+    Html(include_str!("../static/index.html"))
 }
 
 fn remove_expired_rooms(rooms: &mut HashMap<String, Room>, now: Instant, limit: Duration) {
