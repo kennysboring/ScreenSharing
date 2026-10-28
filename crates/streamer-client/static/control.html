@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Painel de Controle - Streamer</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      background-color: #0e0e10;
+      color: #efeff1;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .card {
+      background-color: #18181b;
+      border: 1px solid #2d2d35;
+      border-radius: 12px;
+      padding: 24px;
+      width: 100%;
+      max-width: 480px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    }
+    h1 {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 20px;
+      text-align: center;
+      color: #f1f1f1;
+    }
+    .status-container {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px;
+      background-color: #1f1f23;
+      border-radius: 8px;
+      border: 1px solid #2d2d35;
+      margin-bottom: 16px;
+    }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background-color: #888;
+      flex-shrink: 0;
+    }
+    .status-dot.creating {
+      background-color: #fb8c00;
+    }
+    .status-dot.live {
+      background-color: #e53935;
+      box-shadow: 0 0 8px rgba(229, 57, 53, 0.7);
+    }
+    .status-dot.error {
+      background-color: #d32f2f;
+    }
+    .status-text {
+      font-size: 14px;
+      font-weight: 500;
+      color: #dedee3;
+      word-break: break-word;
+    }
+    .section {
+      display: none;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .section.visible {
+      display: flex;
+    }
+    .viewers-badge {
+      font-size: 15px;
+      font-weight: 600;
+      color: #adadb8;
+    }
+    .link-group {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    label {
+      font-size: 12px;
+      color: #adadb8;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-weight: 600;
+    }
+    .input-row {
+      display: flex;
+      gap: 8px;
+    }
+    input[type="text"] {
+      flex: 1;
+      background-color: #0e0e10;
+      color: #efeff1;
+      border: 1px solid #3a3a44;
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 14px;
+      outline: none;
+      user-select: all;
+      -webkit-user-select: all;
+      transition: border-color 0.15s ease;
+      min-width: 0;
+    }
+    input[type="text"]:focus {
+      border-color: #772ce8;
+    }
+    button {
+      background-color: #26262c;
+      color: #efeff1;
+      border: 1px solid #3a3a44;
+      padding: 10px 16px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      touch-action: manipulation;
+      transition: background-color 0.15s ease, border-color 0.15s ease;
+      -webkit-tap-highlight-color: transparent;
+      white-space: nowrap;
+    }
+    button:hover {
+      background-color: #32323a;
+      border-color: #4e4e5b;
+    }
+    button:active {
+      background-color: #1f1f23;
+    }
+    .error-box {
+      background-color: rgba(211, 47, 47, 0.15);
+      border: 1px solid #d32f2f;
+      border-radius: 8px;
+      padding: 14px;
+      color: #ff8585;
+      font-size: 14px;
+      line-height: 1.4;
+      word-break: break-word;
+      font-weight: 500;
+    }
+    @media (max-width: 480px) {
+      .input-row {
+        flex-direction: column;
+      }
+      button {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <main class="card">
+    <h1>Painel de Controle</h1>
+
+    <div class="status-container">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="status-text" id="statusText" aria-live="polite">conectando...</span>
+    </div>
+
+    <!-- Seção: Live -->
+    <div class="section" id="liveSection">
+      <div class="viewers-badge" id="viewersText">0 viewers conectados</div>
+      <div class="link-group">
+        <label for="viewerLinkInput">Link do Viewer</label>
+        <div class="input-row">
+          <input type="text" id="viewerLinkInput" readonly spellcheck="false" autocomplete="off">
+          <button type="button" id="copyBtn">Copiar link</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Seção: Erro em destaque -->
+    <div class="section" id="errorSection">
+      <div class="error-box" id="errorMessageText"></div>
+    </div>
+  </main>
+
+  <script>
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const liveSection = document.getElementById('liveSection');
+    const viewersText = document.getElementById('viewersText');
+    const viewerLinkInput = document.getElementById('viewerLinkInput');
+    const copyBtn = document.getElementById('copyBtn');
+    const errorSection = document.getElementById('errorSection');
+    const errorMessageText = document.getElementById('errorMessageText');
+
+    let copyResetTimer = null;
+
+    // Um toque no campo seleciona todo o texto
+    viewerLinkInput.addEventListener('click', () => {
+      viewerLinkInput.select();
+    });
+    viewerLinkInput.addEventListener('focus', () => {
+      viewerLinkInput.select();
+    });
+
+    // Copiar link com navigator.clipboard e fallback
+    copyBtn.addEventListener('click', () => {
+      const text = viewerLinkInput.value;
+      if (!text) return;
+
+      const setCopiedLabel = () => {
+        copyBtn.textContent = 'Copiado!';
+        if (copyResetTimer) clearTimeout(copyResetTimer);
+        copyResetTimer = setTimeout(() => {
+          copyBtn.textContent = 'Copiar link';
+          copyResetTimer = null;
+        }, 2000);
+      };
+
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(setCopiedLabel).catch(() => {
+          fallbackCopy(setCopiedLabel);
+        });
+      } else {
+        fallbackCopy(setCopiedLabel);
+      }
+    });
+
+    function fallbackCopy(callback) {
+      viewerLinkInput.select();
+      try {
+        const successful = document.execCommand('copy');
+        if (successful) {
+          callback();
+        }
+      } catch (err) {
+        // Falha silenciosa se não suportado
+      }
+    }
+
+    function setStatus(text, dotClass) {
+      statusText.textContent = text;
+      statusDot.className = 'status-dot';
+      if (dotClass) {
+        statusDot.classList.add(dotClass);
+      }
+    }
+
+    async function pollStatus() {
+      try {
+        const response = await fetch('/api/status');
+        if (!response.ok) {
+          showDisconnected();
+          return;
+        }
+
+        let data;
+        try {
+          data = await response.json();
+        } catch (e) {
+          showDisconnected();
+          return;
+        }
+
+        handleState(data);
+      } catch (err) {
+        showDisconnected();
+      } finally {
+        setTimeout(pollStatus, 1000);
+      }
+    }
+
+    function showDisconnected() {
+      setStatus('programa desconectado', 'error');
+      liveSection.classList.remove('visible');
+      errorSection.classList.remove('visible');
+    }
+
+    function handleState(data) {
+      if (!data || typeof data.state !== 'string') {
+        setStatus('estado desconhecido', null);
+        liveSection.classList.remove('visible');
+        errorSection.classList.remove('visible');
+        return;
+      }
+
+      switch (data.state) {
+        case 'creating':
+          setStatus('criando a sala...', 'creating');
+          liveSection.classList.remove('visible');
+          errorSection.classList.remove('visible');
+          break;
+
+        case 'live':
+          setStatus('ao vivo', 'live');
+          errorSection.classList.remove('visible');
+          liveSection.classList.add('visible');
+
+          const count = typeof data.viewers === 'number' ? data.viewers : 0;
+          if (count === 1) {
+            viewersText.textContent = '1 viewer conectado';
+          } else {
+            viewersText.textContent = count + ' viewers conectados';
+          }
+
+          if (typeof data.viewerLink === 'string') {
+            viewerLinkInput.value = data.viewerLink;
+          }
+          break;
+
+        case 'error':
+          setStatus('erro', 'error');
+          liveSection.classList.remove('visible');
+          errorMessageText.textContent = typeof data.message === 'string' ? data.message : 'Ocorreu um erro inesperado.';
+          errorSection.classList.add('visible');
+          break;
+
+        default:
+          setStatus('estado desconhecido', null);
+          liveSection.classList.remove('visible');
+          errorSection.classList.remove('visible');
+          break;
+      }
+    }
+
+    // Inicia o ciclo de polling
+    pollStatus();
+  </script>
+</body>
+</html>

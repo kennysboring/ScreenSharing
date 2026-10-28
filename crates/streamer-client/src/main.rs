@@ -1,14 +1,25 @@
+use axum::{Json, Router, response::Html, routing::get, serve::Listener};
 use common::CreateRoomResponse;
 use futures_util::StreamExt;
 use reqwest::{
     Client, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
 };
+use serde::Serialize;
 use std::{env::args, process::ExitCode};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Error::Http, client::IntoClientRequest, handshake::client::Request},
 };
+
+
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
+enum PanelStatus {
+    Creating,
+    Live { viewer_link: String, viewers: usize },
+    Error { message: String },
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -17,6 +28,7 @@ async fn main() -> ExitCode {
         eprintln!("{msg}");
         return ExitCode::FAILURE;
     }
+    tokio::spawn(run_panel());
 
     let http_url = format!("http://{addr}/rooms");
 
@@ -70,6 +82,33 @@ async fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+async fn run_panel() {
+    let app = Router::new()
+        .route("/api/status", get(panel_status))
+        .route("/", get(panel_page));
+    
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:8787").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Error not allowed to use the port: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("Error axum::serve: {e}");
+        return ;
+    };
+}
+
+async fn panel_status() -> Json<PanelStatus>{
+    Json(PanelStatus::Live { viewer_link: "http://test".to_string(), viewers: 2 })
+}
+
+async fn panel_page() -> Html<&'static str> {
+    Html(include_str!("../static/control.html"))
 }
 
 fn validate_addr(addr: &str) -> Result<(), &'static str> {

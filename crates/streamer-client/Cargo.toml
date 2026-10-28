@@ -10,3 +10,5 @@ futures-util  = { workspace = true }
 tokio  = { workspace = true }
 serde_json  = { workspace = true }
 common  = { workspace = true }
+axum  = { workspace = true }
+serde  = { workspace = true }
