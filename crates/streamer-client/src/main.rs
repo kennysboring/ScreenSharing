@@ -1,25 +1,46 @@
-use axum::{Json, Router, response::Html, routing::get, serve::Listener};
-use common::CreateRoomResponse;
+use axum::{Json, Router, extract::State, response::Html, routing::get};
+use common::{CreateRoomResponse, ViewerId};
 use futures_util::StreamExt;
 use reqwest::{
     Client, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
 };
 use serde::Serialize;
-use std::{env::args, process::ExitCode};
+use std::{
+    collections::HashSet,
+    env::args,
+    process::ExitCode,
+    sync::{Arc, Mutex},
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Error::Http, client::IntoClientRequest, handshake::client::Request},
 };
 
-
 #[derive(Serialize)]
-#[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 enum PanelStatus {
     Creating,
     Live { viewer_link: String, viewers: usize },
     Error { message: String },
 }
+
+enum Phase {
+    Creating,
+    Live { viewer_link: String },
+    Error { message: String },
+}
+
+struct Panel {
+    phase: Phase,
+    viewers: HashSet<ViewerId>,
+}
+
+type SharedPanel = Arc<Mutex<Panel>>;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -28,7 +49,12 @@ async fn main() -> ExitCode {
         eprintln!("{msg}");
         return ExitCode::FAILURE;
     }
-    tokio::spawn(run_panel());
+
+    let panel: SharedPanel = Arc::new(Mutex::new(Panel {
+        phase: Phase::Creating,
+        viewers: HashSet::new(),
+    }));
+    tokio::spawn(run_panel(Arc::clone(&panel)));
 
     let http_url = format!("http://{addr}/rooms");
 
@@ -68,6 +94,14 @@ async fn main() -> ExitCode {
         }
     };
 
+    let viewer_link = format!("http://{addr}/room/{}", room.room_id);
+    {
+        // .lock in
+        let mut guard = panel.lock().unwrap();
+
+        guard.phase = Phase::Live { viewer_link };
+    } // .lock out
+
     let (_, mut split_stream) = ws_stream.split();
     while let Some(message) = split_stream.next().await {
         match message {
@@ -84,11 +118,12 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn run_panel() {
+async fn run_panel(panel: SharedPanel) {
     let app = Router::new()
         .route("/api/status", get(panel_status))
-        .route("/", get(panel_page));
-    
+        .route("/", get(panel_page))
+        .with_state(panel);
+
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:8787").await {
         Ok(l) => l,
         Err(e) => {
@@ -99,12 +134,22 @@ async fn run_panel() {
 
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("Error axum::serve: {e}");
-        return ;
+        return;
     };
 }
 
-async fn panel_status() -> Json<PanelStatus>{
-    Json(PanelStatus::Live { viewer_link: "http://test".to_string(), viewers: 2 })
+async fn panel_status(State(panel): State<SharedPanel>) -> Json<PanelStatus> {
+    let guard = panel.lock().unwrap();
+    match &guard.phase {
+        Phase::Creating => Json(PanelStatus::Creating),
+        Phase::Live { viewer_link } => Json(PanelStatus::Live {
+            viewer_link: viewer_link.clone(),
+            viewers: guard.viewers.len(),
+        }),
+        Phase::Error { message } => Json(PanelStatus::Error {
+            message: message.clone(),
+        }),
+    }
 }
 
 async fn panel_page() -> Html<&'static str> {
@@ -184,7 +229,10 @@ mod tests {
 
         let req = build_ws_request("127.0.0.1:3000", &room).expect("should build ws request");
 
-        assert_eq!(req.uri().to_string(), "ws://127.0.0.1:3000/ws/host/room-abc-123");
+        assert_eq!(
+            req.uri().to_string(),
+            "ws://127.0.0.1:3000/ws/host/room-abc-123"
+        );
         assert_eq!(
             req.headers().get(AUTHORIZATION),
             Some(&HeaderValue::from_static("Bearer token-xyz-456"))
@@ -214,7 +262,11 @@ mod tests {
 
         let result = build_ws_request("invalid uri with spaces:80", &room);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Error to create WebSocket request"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Error to create WebSocket request")
+        );
     }
 
     async fn spawn_mock_http_server(
@@ -307,6 +359,10 @@ mod tests {
         let result = create_room(&client, "http://127.0.0.1:1/rooms").await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().starts_with("Server is not working. Error = "));
+        assert!(
+            result
+                .unwrap_err()
+                .starts_with("Server is not working. Error = ")
+        );
     }
 }

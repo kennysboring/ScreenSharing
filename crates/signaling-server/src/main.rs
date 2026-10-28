@@ -1,11 +1,16 @@
 use axum::{
-    Json, Router, extract::{
+    Json, Router,
+    extract::{
         Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
-    }, http::{HeaderMap, StatusCode, header::AUTHORIZATION}, response::{self, Html, Response}, routing::{get, post},
+    },
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    response::{self, Html, Response},
+    routing::{get, post},
 };
 use common::{
-    CreateRoomResponse, HostToServer, ServerToHost, ServerToViewer, SignalMessage, ViewerId, ViewerToServer,
+    CreateRoomResponse, HostToServer, ServerToHost, ServerToViewer, SignalMessage, ViewerId,
+    ViewerToServer,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -110,7 +115,7 @@ async fn create_room(
     Ok(Json(response))
 }
 
-async fn get_html() -> axum::response::Html<&'static str>{
+async fn get_html() -> axum::response::Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
 
@@ -180,7 +185,7 @@ async fn web_socket_upgrade_host(
                     Some(Err(_)) => break,
                     None => break,
                     _ => continue,
-                
+
                 }
             }
         }
@@ -334,8 +339,8 @@ fn handle_viewer_message(msg: &str, state: &SharedState, room_id: &str, id: View
 }
 
 fn handle_host_message(msg: &str, state: &SharedState, room_id: &str, id_host: Uuid) -> bool {
-    let (to , signal_message) = match serde_json::from_str::<HostToServer>(msg) {
-        Ok(HostToServer::SignalToViewer { to, message } ) => match message {
+    let (to, signal_message) = match serde_json::from_str::<HostToServer>(msg) {
+        Ok(HostToServer::SignalToViewer { to, message }) => match message {
             SignalMessage::Offer { .. } | SignalMessage::Ice { .. } => (to, message),
             SignalMessage::Answer { .. } => return false,
         },
@@ -350,15 +355,21 @@ fn handle_host_message(msg: &str, state: &SharedState, room_id: &str, id_host: U
             return true;
         };
 
-        if !matches!(&room.host, Some(h) if h.id == id_host){return false;}
+        if !matches!(&room.host, Some(h) if h.id == id_host) {
+            return false;
+        }
 
-        let Some(viewer) = room.viewers.get(&to) else { return true };
+        let Some(viewer) = room.viewers.get(&to) else {
+            return true;
+        };
 
-        let server_message = ServerToViewer::SignalFromHost { message: signal_message };
+        let server_message = ServerToViewer::SignalFromHost {
+            message: signal_message,
+        };
 
         match viewer.try_send(server_message) {
             Ok(_) => return true,
-            Err(TrySendError::Full(_)) => {},
+            Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Closed(_)) => return true,
         }
     } // .lock out
@@ -368,7 +379,6 @@ fn handle_host_message(msg: &str, state: &SharedState, room_id: &str, id_host: U
 }
 
 fn register_host(room: &mut Room) -> (Receiver<ServerToHost>, Uuid) {
-
     let id = Uuid::new_v4();
     let (sender, receiver) = channel::<ServerToHost>(CAPACITY_CHANNEL);
 
@@ -383,7 +393,9 @@ fn register_host(room: &mut Room) -> (Receiver<ServerToHost>, Uuid) {
 }
 
 fn unregister_host(room: &mut Room, id_host: Uuid, now: Instant) {
-    if matches!(&room.host, Some(host) if host.id == id_host) {return;}
+    if matches!(&room.host, Some(host) if host.id == id_host) {
+        return;
+    }
 
     room.host = None;
     room.host_absent_since = Some(now);
@@ -791,12 +803,7 @@ mod tests {
         let (mut rx, _id) = register_host(&mut room);
 
         let msg = rx.try_recv().expect("deve receber ViewerList vazia");
-        assert_eq!(
-            msg,
-            ServerToHost::ViewerList {
-                viewers: vec![]
-            }
-        );
+        assert_eq!(msg, ServerToHost::ViewerList { viewers: vec![] });
     }
 
     #[test]
