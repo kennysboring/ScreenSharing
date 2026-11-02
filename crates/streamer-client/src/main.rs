@@ -1,5 +1,5 @@
 use axum::{Json, Router, extract::State, response::Html, routing::get};
-use common::{CreateRoomResponse, ViewerId};
+use common::{CreateRoomResponse, ServerToHost, ViewerId};
 use futures_util::StreamExt;
 use reqwest::{
     Client, StatusCode,
@@ -13,8 +13,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{Error::Http, client::IntoClientRequest, handshake::client::Request},
+    connect_async, tungstenite::{Error::Http, Message, client::IntoClientRequest, handshake::client::Request},
 };
 
 #[derive(Serialize)]
@@ -105,9 +104,17 @@ async fn main() -> ExitCode {
     let (_, mut split_stream) = ws_stream.split();
     while let Some(message) = split_stream.next().await {
         match message {
-            Ok(message) => {
-                println!("{message}")
+            Ok(Message::Text(text)) => {
+                // 1. tentar transformar `text` em ServerToHost
+                let Ok(msg) = serde_json::from_str::<ServerToHost>(&text) else { continue; };
+
+                { //.lock in
+                    let mut guard = panel.lock().unwrap();
+                    apply_server_message(&mut guard, msg);
+                } //.lock out
             }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("Error in WebSocket messages : {e}");
                 break;
@@ -192,6 +199,15 @@ async fn create_room(client: &Client, url: &str) -> Result<CreateRoomResponse, S
             .map_err(|e| format!("Error: {e}")),
         StatusCode::SERVICE_UNAVAILABLE => Err("full rooms, try again later".to_string()),
         other_cases => Err(format!("Error: cases do not defined: {other_cases}")),
+    }
+}
+
+fn apply_server_message(panel: &mut Panel, msg: ServerToHost) {
+    match msg {
+        ServerToHost::ViewerJoined { viewer_id } => {panel.viewers.insert(viewer_id);},
+        ServerToHost::ViewerLeft { viewer_id } => {panel.viewers.remove(&viewer_id);},
+        ServerToHost::SignalFromViewer { .. } => {},
+        ServerToHost::ViewerList { viewers } => panel.viewers = viewers.into_iter().collect(),
     }
 }
 
@@ -364,5 +380,121 @@ mod tests {
                 .unwrap_err()
                 .starts_with("Server is not working. Error = ")
         );
+    }
+
+    fn new_test_panel() -> Panel {
+        Panel {
+            phase: Phase::Creating,
+            viewers: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn test_apply_server_message_viewer_joined() {
+        let mut panel = new_test_panel();
+
+        // 1. Inserir o primeiro viewer
+        apply_server_message(
+            &mut panel,
+            ServerToHost::ViewerJoined {
+                viewer_id: ViewerId(1),
+            },
+        );
+        assert_eq!(panel.viewers.len(), 1);
+        assert!(panel.viewers.contains(&ViewerId(1)));
+
+        // 2. Inserir um segundo viewer diferente
+        apply_server_message(
+            &mut panel,
+            ServerToHost::ViewerJoined {
+                viewer_id: ViewerId(2),
+            },
+        );
+        assert_eq!(panel.viewers.len(), 2);
+        assert!(panel.viewers.contains(&ViewerId(1)));
+        assert!(panel.viewers.contains(&ViewerId(2)));
+
+        // 3. Inserir novamente um viewer já existente (comportamento de conjunto)
+        apply_server_message(
+            &mut panel,
+            ServerToHost::ViewerJoined {
+                viewer_id: ViewerId(1),
+            },
+        );
+        assert_eq!(panel.viewers.len(), 2);
+    }
+
+    #[test]
+    fn test_apply_server_message_viewer_left() {
+        let mut panel = new_test_panel();
+        panel.viewers.insert(ViewerId(1));
+        panel.viewers.insert(ViewerId(2));
+
+        // 1. Remover um viewer existente
+        apply_server_message(
+            &mut panel,
+            ServerToHost::ViewerLeft {
+                viewer_id: ViewerId(1),
+            },
+        );
+        assert_eq!(panel.viewers.len(), 1);
+        assert!(!panel.viewers.contains(&ViewerId(1)));
+        assert!(panel.viewers.contains(&ViewerId(2)));
+
+        // 2. Remover um viewer que não estava presente (não deve causar pânico)
+        apply_server_message(
+            &mut panel,
+            ServerToHost::ViewerLeft {
+                viewer_id: ViewerId(99),
+            },
+        );
+        assert_eq!(panel.viewers.len(), 1);
+        assert!(panel.viewers.contains(&ViewerId(2)));
+    }
+
+    #[test]
+    fn test_apply_server_message_viewer_list() {
+        let mut panel = new_test_panel();
+        panel.viewers.insert(ViewerId(99)); // viewer anterior
+
+        // 1. ViewerList substitui completamente os viewers anteriores
+        apply_server_message(
+            &mut panel,
+            ServerToHost::ViewerList {
+                viewers: vec![ViewerId(1), ViewerId(2), ViewerId(3)],
+            },
+        );
+        let expected: HashSet<ViewerId> =
+            [ViewerId(1), ViewerId(2), ViewerId(3)].into_iter().collect();
+        assert_eq!(panel.viewers, expected);
+
+        // 2. ViewerList vazia zera os viewers do painel
+        apply_server_message(
+            &mut panel,
+            ServerToHost::ViewerList {
+                viewers: vec![],
+            },
+        );
+        assert!(panel.viewers.is_empty());
+    }
+
+    #[test]
+    fn test_apply_server_message_signal_from_viewer_is_ignored() {
+        let mut panel = new_test_panel();
+        panel.viewers.insert(ViewerId(1));
+
+        // SignalFromViewer não deve alterar os viewers do painel
+        apply_server_message(
+            &mut panel,
+            ServerToHost::SignalFromViewer {
+                from: ViewerId(1),
+                message: common::SignalMessage::Offer {
+                    sdp: "v=0...".to_string(),
+                },
+            },
+        );
+
+        assert_eq!(panel.viewers.len(), 1);
+        assert!(panel.viewers.contains(&ViewerId(1)));
     }
 }
