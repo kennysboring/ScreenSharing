@@ -12,3 +12,5 @@ serde_json  = { workspace = true }
 common  = { workspace = true }
 axum  = { workspace = true }
 serde  = { workspace = true }
+webrtc  = { workspace = true }
+async-trait = { workspace = true }

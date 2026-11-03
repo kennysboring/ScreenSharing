@@ -16,3 +16,5 @@ uuid = {version = "1.28.0", features = ["v4"]}
 futures-util = "0.3.34"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tokio-tungstenite = "0.30.0"
+webrtc = "0.21.1"
+async-trait = "0.1.92"

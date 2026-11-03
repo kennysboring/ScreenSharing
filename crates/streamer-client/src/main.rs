@@ -1,6 +1,6 @@
 use axum::{Json, Router, extract::State, response::Html, routing::get};
-use common::{CreateRoomResponse, ServerToHost, ViewerId};
-use futures_util::StreamExt;
+use common::{CreateRoomResponse, HostToServer, ServerToHost, SignalMessage, ViewerId};
+use futures_util::{SinkExt, StreamExt};
 use reqwest::{
     Client, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
@@ -15,6 +15,18 @@ use std::{
 use tokio_tungstenite::{
     connect_async, tungstenite::{Error::Http, Message, client::IntoClientRequest, handshake::client::Request},
 };
+use webrtc::peer_connection::{
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+    RTCConfigurationBuilder, RTCIceServer, RTCPeerConnectionIceEvent,
+};
+
+#[derive(Clone)]
+struct Handler;
+
+#[async_trait::async_trait]
+impl PeerConnectionEventHandler for Handler {
+    async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {}
+}
 
 #[derive(Serialize)]
 #[serde(
@@ -47,6 +59,10 @@ async fn main() -> ExitCode {
     if let Err(msg) = validate_addr(&addr) {
         eprintln!("{msg}");
         return ExitCode::FAILURE;
+    }
+
+    if let Err(e) = make_offer().await {
+        eprintln!("Error to create the offer: {e}");
     }
 
     let panel: SharedPanel = Arc::new(Mutex::new(Panel {
@@ -101,17 +117,36 @@ async fn main() -> ExitCode {
         guard.phase = Phase::Live { viewer_link };
     } // .lock out
 
-    let (_, mut split_stream) = ws_stream.split();
+    let (mut split_sink, mut split_stream) = ws_stream.split();
     while let Some(message) = split_stream.next().await {
         match message {
             Ok(Message::Text(text)) => {
-                // 1. tentar transformar `text` em ServerToHost
                 let Ok(msg) = serde_json::from_str::<ServerToHost>(&text) else { continue; };
+
+                if let ServerToHost::SignalFromViewer { message: SignalMessage::Answer { .. }, .. } = &msg {
+                    println!("answer recebido");
+                }
+
+                let joined = match &msg {
+                    ServerToHost::ViewerJoined { viewer_id } => Some(*viewer_id),
+                    _ => None,
+                };
 
                 { //.lock in
                     let mut guard = panel.lock().unwrap();
                     apply_server_message(&mut guard, msg);
                 } //.lock out
+
+                if let Some(viewer_id) = joined {
+                    let Ok(sdp) = make_offer().await else { continue; };
+                    let reply = HostToServer::SignalToViewer {
+                        to: viewer_id,
+                        message: SignalMessage::Offer { sdp },
+                    };
+                    let Ok(json) = serde_json::to_string(&reply) else { continue; };
+                    if split_sink.send(Message::Text(json.into())).await.is_err() { break; }
+                }
+
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
@@ -209,6 +244,29 @@ fn apply_server_message(panel: &mut Panel, msg: ServerToHost) {
         ServerToHost::SignalFromViewer { .. } => {},
         ServerToHost::ViewerList { viewers } => panel.viewers = viewers.into_iter().collect(),
     }
+}
+
+async fn make_offer() -> Result<String, Box<dyn std::error::Error>> {
+
+    let config = RTCConfigurationBuilder::default()
+    .with_ice_servers(vec![RTCIceServer {
+        urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+        ..Default::default()
+    }])
+    .build();
+
+    let pc = PeerConnectionBuilder::new()
+        .with_configuration(config)
+        .with_handler(Arc::new(Handler))
+        .with_udp_addrs(vec!["0.0.0.0:0"])
+        .build()
+        .await?;
+
+    let offer = pc.create_offer(None).await?;
+    let offer_sdp = offer.sdp.clone();
+    pc.set_local_description(offer).await?;
+
+    Ok(offer_sdp)
 }
 
 #[cfg(test)]
