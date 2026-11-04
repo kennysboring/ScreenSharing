@@ -7,17 +7,19 @@ use reqwest::{
 };
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env::args,
     process::ExitCode,
     sync::{Arc, Mutex},
 };
 use tokio_tungstenite::{
-    connect_async, tungstenite::{Error::Http, Message, client::IntoClientRequest, handshake::client::Request},
+    connect_async,
+    tungstenite::{Error::Http, Message, client::IntoClientRequest, handshake::client::Request},
 };
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-    RTCConfigurationBuilder, RTCIceServer, RTCPeerConnectionIceEvent,
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
+    RTCIceCandidateInit, RTCIceServer, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
+    RTCSessionDescription,
 };
 
 #[derive(Clone)]
@@ -25,7 +27,16 @@ struct Handler;
 
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for Handler {
-    async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {}
+    async fn on_ice_candidate(&self, _event: RTCPeerConnectionIceEvent) {}
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        println!("state connection: {state}");
+    }
+}
+
+struct Session {
+    pc: Arc<dyn PeerConnection>,
+    answered: bool,
+    pending: Vec<RTCIceCandidateInit>,
 }
 
 #[derive(Serialize)]
@@ -118,13 +129,61 @@ async fn main() -> ExitCode {
     } // .lock out
 
     let (mut split_sink, mut split_stream) = ws_stream.split();
+
+    let mut sessions: HashMap<ViewerId, Session> = HashMap::new();
     while let Some(message) = split_stream.next().await {
         match message {
             Ok(Message::Text(text)) => {
-                let Ok(msg) = serde_json::from_str::<ServerToHost>(&text) else { continue; };
+                let Ok(msg) = serde_json::from_str::<ServerToHost>(&text) else {
+                    continue;
+                };
 
-                if let ServerToHost::SignalFromViewer { message: SignalMessage::Answer { .. }, .. } = &msg {
-                    println!("answer recebido");
+                if let ServerToHost::SignalFromViewer {
+                    from,
+                    message: SignalMessage::Answer { sdp },
+                } = &msg
+                    && let Some(session) = sessions.get_mut(from)
+                {
+                    let Ok(desc) = RTCSessionDescription::answer(sdp.clone()) else {
+                        continue;
+                    };
+                    match session.pc.set_remote_description(desc).await {
+                        Ok(_) => {
+                            println!("answer applied");
+                            session.answered = true;
+                            for candidate in std::mem::take(&mut session.pending) {
+                                let _ = session.pc.add_ice_candidate(candidate).await;
+                            }
+                        }
+                        Err(e) => println!("failure to apply the answer {e}"),
+                    }
+                }
+
+                if let ServerToHost::SignalFromViewer {
+                    from,
+                    message:
+                        SignalMessage::Ice {
+                            candidate,
+                            sdp_mid,
+                            sdp_mline_index,
+                            username_fragment,
+                        },
+                } = &msg
+                    && let Some(session) = sessions.get_mut(from)
+                {
+                    let init = RTCIceCandidateInit {
+                        candidate: candidate.clone(),
+                        sdp_mid: sdp_mid.clone(),
+                        sdp_mline_index: *sdp_mline_index,
+                        username_fragment: username_fragment.clone(),
+                        ..Default::default()
+                    };
+                    // se session.answered: add_ice_candidate(init).await, senão session.pending.push(init)
+                    if session.answered {
+                        let _ = session.pc.add_ice_candidate(init).await;
+                    } else {
+                        session.pending.push(init)
+                    }
                 }
 
                 let joined = match &msg {
@@ -132,21 +191,49 @@ async fn main() -> ExitCode {
                     _ => None,
                 };
 
-                { //.lock in
+                if let ServerToHost::ViewerLeft { viewer_id } = &msg {
+                    if let Some(session) = sessions.remove(viewer_id) {
+                        let _ = session.pc.close().await;
+                    }
+                    println!("sessões ativas: {}", sessions.len());
+                }
+
+                {
+                    //.lock in
                     let mut guard = panel.lock().unwrap();
                     apply_server_message(&mut guard, msg);
                 } //.lock out
 
                 if let Some(viewer_id) = joined {
-                    let Ok(sdp) = make_offer().await else { continue; };
+                    let (sdp, pc) = match make_offer().await {
+                        Ok((sdp, pc)) => (sdp, pc),
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            continue;
+                        }
+                    };
+
+                    sessions.insert(
+                        viewer_id,
+                        Session {
+                            pc,
+                            answered: false,
+                            pending: Vec::new(),
+                        },
+                    );
+                    println!("sessões ativas: {}", sessions.len());
+
                     let reply = HostToServer::SignalToViewer {
                         to: viewer_id,
                         message: SignalMessage::Offer { sdp },
                     };
-                    let Ok(json) = serde_json::to_string(&reply) else { continue; };
-                    if split_sink.send(Message::Text(json.into())).await.is_err() { break; }
+                    let Ok(json) = serde_json::to_string(&reply) else {
+                        continue;
+                    };
+                    if split_sink.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
                 }
-
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
@@ -176,8 +263,7 @@ async fn run_panel(panel: SharedPanel) {
 
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("Error axum::serve: {e}");
-        return;
-    };
+    }
 }
 
 async fn panel_status(State(panel): State<SharedPanel>) -> Json<PanelStatus> {
@@ -239,21 +325,24 @@ async fn create_room(client: &Client, url: &str) -> Result<CreateRoomResponse, S
 
 fn apply_server_message(panel: &mut Panel, msg: ServerToHost) {
     match msg {
-        ServerToHost::ViewerJoined { viewer_id } => {panel.viewers.insert(viewer_id);},
-        ServerToHost::ViewerLeft { viewer_id } => {panel.viewers.remove(&viewer_id);},
-        ServerToHost::SignalFromViewer { .. } => {},
+        ServerToHost::ViewerJoined { viewer_id } => {
+            panel.viewers.insert(viewer_id);
+        }
+        ServerToHost::ViewerLeft { viewer_id } => {
+            panel.viewers.remove(&viewer_id);
+        }
+        ServerToHost::SignalFromViewer { .. } => {}
         ServerToHost::ViewerList { viewers } => panel.viewers = viewers.into_iter().collect(),
     }
 }
 
-async fn make_offer() -> Result<String, Box<dyn std::error::Error>> {
-
+async fn make_offer() -> Result<(String, Arc<dyn PeerConnection>), Box<dyn std::error::Error>> {
     let config = RTCConfigurationBuilder::default()
-    .with_ice_servers(vec![RTCIceServer {
-        urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-        ..Default::default()
-    }])
-    .build();
+        .with_ice_servers(vec![RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            ..Default::default()
+        }])
+        .build();
 
     let pc = PeerConnectionBuilder::new()
         .with_configuration(config)
@@ -262,11 +351,15 @@ async fn make_offer() -> Result<String, Box<dyn std::error::Error>> {
         .build()
         .await?;
 
+    let pc: Arc<dyn PeerConnection> = Arc::new(pc);
+
+    let _dc = pc.create_data_channel("probe", None).await?;
+
     let offer = pc.create_offer(None).await?;
     let offer_sdp = offer.sdp.clone();
     pc.set_local_description(offer).await?;
 
-    Ok(offer_sdp)
+    Ok((offer_sdp, pc))
 }
 
 #[cfg(test)]
@@ -522,17 +615,13 @@ mod tests {
                 viewers: vec![ViewerId(1), ViewerId(2), ViewerId(3)],
             },
         );
-        let expected: HashSet<ViewerId> =
-            [ViewerId(1), ViewerId(2), ViewerId(3)].into_iter().collect();
+        let expected: HashSet<ViewerId> = [ViewerId(1), ViewerId(2), ViewerId(3)]
+            .into_iter()
+            .collect();
         assert_eq!(panel.viewers, expected);
 
         // 2. ViewerList vazia zera os viewers do painel
-        apply_server_message(
-            &mut panel,
-            ServerToHost::ViewerList {
-                viewers: vec![],
-            },
-        );
+        apply_server_message(&mut panel, ServerToHost::ViewerList { viewers: vec![] });
         assert!(panel.viewers.is_empty());
     }
 

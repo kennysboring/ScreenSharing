@@ -294,14 +294,13 @@ fn remove_viewer(state: &SharedState, room_id: &str, id: ViewerId) {
         // .lock in
         let mut guard = state.lock().unwrap();
 
-        if let Some(room) = guard.0.get_mut(room_id) {
-            if room.viewers.remove(&id).is_some() {
-                if let Some(host) = &room.host {
-                    let _ = host
-                        .sender
-                        .try_send(ServerToHost::ViewerLeft { viewer_id: id });
-                }
-            }
+        if let Some(room) = guard.0.get_mut(room_id)
+            && room.viewers.remove(&id).is_some()
+            && let Some(host) = &room.host
+        {
+            let _ = host
+                .sender
+                .try_send(ServerToHost::ViewerLeft { viewer_id: id });
         }
     } // .lock out
 }
