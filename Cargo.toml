@@ -5,6 +5,8 @@ members = [
     "crates/streamer-client",
     "crates/common"
 ]
+# Experiments with system dependencies (libpipewire, libclang) stay out of workspace builds
+exclude = ["spikes/capture"]
 
 [workspace.dependencies]
 common = { path = "crates/common" }

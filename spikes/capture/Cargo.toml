@@ -1,0 +1,12 @@
+[package]
+name = "capture-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ashpd = { version = "0.14", default-features = false, features = ["tokio", "screencast"] }
+# v1_2_0 enables DONT_FIXATE and the MODIFIER / MODIFIER_FIXATION_REQUIRED video flags,
+# needed to negotiate DMA-BUF modifiers (the system PipeWire is 1.6)
+pipewire = { version = "0.10", features = ["v1_2_0"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
