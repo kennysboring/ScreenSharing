@@ -1,0 +1,13 @@
+[package]
+name = "encoder-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Stateless H.264 encoder over VA-API; re-exports its libva wrapper (cros-libva 0.0.12)
+cros-codecs = { version = "0.0.6", features = ["vaapi"] }
+
+# cros-libva 0.0.12 does not build against libva 2.23+; see vendor/PATCH.md
+[patch.crates-io]
+cros-libva = { path = "vendor/cros-libva" }
