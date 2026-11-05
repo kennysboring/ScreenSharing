@@ -1,5 +1,4 @@
-//! Sends a pre-encoded H.264 file through a video track, one frame every 33 ms.
-
+use bytes::Bytes;
 use rtc::{
     media::{Sample, io::h26x_reader::H26xSampleReader},
     rtp_transceiver::PayloadType,
@@ -10,7 +9,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{sync::mpsc::Receiver, time::interval};
+use tokio::{
+    sync::{broadcast, mpsc::Receiver},
+    time::{Interval, interval},
+};
 use webrtc::media_stream::{Track, track_local::static_sample::TrackLocalStaticSample};
 
 #[derive(Default)]
@@ -33,6 +35,12 @@ impl KeyframeGate {
     pub fn wait_for_keyframe(&mut self) {
         self.open = false
     }
+}
+
+#[derive(Clone)]
+pub struct EncodedFrame {
+    pub data: Bytes,
+    pub timed: bool,
 }
 
 const TEST_VIDEO_PATH: &str = "test-assets/test.h264";
@@ -108,6 +116,58 @@ async fn stream_video(
 /// empty.
 fn nal_type(data: &[u8]) -> Option<u8> {
     data.first().map(|byte| byte & 0x1f)
+}
+
+/// Sends the test video to `tx` in the background, starting over each time the file ends.
+/// Stops if the file cannot be read or has no frames.
+pub fn start_test_source(tx: broadcast::Sender<EncodedFrame>, path: String) {
+    tokio::spawn(async move {
+        // One ticker for every pass, so the pace carries on across the restart
+        let mut ticker = interval(H26X_FRAME_DURATION);
+        loop {
+            match send_file_once(&tx, &path, &mut ticker).await {
+                // Without this check an empty file would restart forever without waiting
+                Ok(0) => {
+                    eprintln!("Test video has no frames: {path}");
+                    return;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("Error reading the test video: {e}");
+                    return;
+                }
+            }
+        }
+    });
+}
+
+async fn send_file_once(
+    tx: &broadcast::Sender<EncodedFrame>,
+    path: &str,
+    ticker: &mut Interval,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let file = File::open(path)?;
+    let mut video_reader = H26xSampleReader::new(BufReader::new(file), 1_048_576, false);
+
+    let mut sent = 0;
+    loop {
+        let sample = match video_reader.next_sample() {
+            Ok(sample) => sample,
+            Err(webrtc::error::Error::ErrIoEOF) => return Ok(sent),
+            Err(e) => return Err(e.into()),
+        };
+
+        // No receivers is not an error: the source keeps its pace for whoever joins later
+        let _ = tx.send(EncodedFrame {
+            data: sample.data,
+            timed: sample.timed,
+        });
+        sent += 1;
+
+        if sample.timed {
+            ticker.tick().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +278,121 @@ mod tests {
     fn test_keyframe_gate_starts_closed() {
         let mut gate = KeyframeGate::default();
         assert!(!gate.should_send(Some(1)));
+    }
+
+    #[tokio::test]
+    async fn test_source_sends_headers_then_keyframe() {
+        let (tx, mut rx) = broadcast::channel(30);
+
+        // The crate lives in crates/streamer-client, the test video at the workspace root
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(TEST_VIDEO_PATH);
+        start_test_source(tx, path.to_str().unwrap().to_owned());
+
+        let mut types = Vec::new();
+        for _ in 0..3 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("source should send a frame in time")
+                .expect("channel should stay open");
+            types.push(nal_type(&frame.data));
+        }
+
+        assert_eq!(types, [Some(7), Some(8), Some(5)]); // SPS, PPS, IDR
+    }
+
+    #[tokio::test]
+    async fn test_source_paces_timed_frames() {
+        let (tx, mut rx) = broadcast::channel(30);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(TEST_VIDEO_PATH);
+        start_test_source(tx, path.to_str().unwrap().to_owned());
+
+        // Arrival time of the next timed frame, skipping the untimed SPS/PPS
+        async fn next_timed(rx: &mut broadcast::Receiver<EncodedFrame>) -> Instant {
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("source should send a frame in time")
+                    .expect("channel should stay open");
+                if frame.timed {
+                    return Instant::now();
+                }
+            }
+        }
+
+        // The first tick of an interval completes at once, so the IDR and the first P-frame
+        // leave together. The pace shows from the second timed frame to the third.
+        next_timed(&mut rx).await;
+        let second = next_timed(&mut rx).await;
+        let third = next_timed(&mut rx).await;
+
+        let gap = third - second;
+        assert!(
+            (Duration::from_millis(20)..=Duration::from_millis(80)).contains(&gap),
+            "timed frames should be about 33 ms apart, got {gap:?}"
+        );
+    }
+
+    /// Receives one frame, failing instead of hanging if none comes.
+    async fn recv_frame(
+        rx: &mut broadcast::Receiver<EncodedFrame>,
+    ) -> Result<EncodedFrame, broadcast::error::RecvError> {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("source should send or close in time")
+    }
+
+    #[tokio::test]
+    async fn test_source_starts_over_when_file_ends() {
+        // A tiny Annex B stream: SPS, PPS, IDR, P-frame
+        let path = temp_file_path("loop.h264");
+        let mut stream = Vec::new();
+        for nal in [[0x67, 0x42], [0x68, 0xce], [0x65, 0x88], [0x41, 0x9a]] {
+            stream.extend_from_slice(&[0, 0, 0, 1]);
+            stream.extend_from_slice(&nal);
+        }
+        std::fs::write(&path, stream).expect("should write the test stream");
+
+        let (tx, mut rx) = broadcast::channel(30);
+        start_test_source(tx, path.to_str().unwrap().to_owned());
+
+        let mut types = Vec::new();
+        for _ in 0..8 {
+            let frame = recv_frame(&mut rx).await.expect("channel should stay open");
+            types.push(nal_type(&frame.data));
+        }
+        let _ = std::fs::remove_file(&path);
+
+        // After the last frame the file starts again with the SPS
+        let pass = [Some(7), Some(8), Some(5), Some(1)];
+        assert_eq!(types, [pass, pass].concat());
+    }
+
+    #[tokio::test]
+    async fn test_source_stops_on_empty_file() {
+        let path = temp_file_path("empty-source.h264");
+        std::fs::write(&path, []).expect("should create empty file");
+
+        let (tx, mut rx) = broadcast::channel(30);
+        start_test_source(tx, path.to_str().unwrap().to_owned());
+
+        // The task ends and drops the sender instead of restarting forever
+        let result = recv_frame(&mut rx).await;
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(result, Err(broadcast::error::RecvError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn test_source_stops_on_missing_file() {
+        let path = temp_file_path("missing-source.h264");
+
+        let (tx, mut rx) = broadcast::channel(30);
+        start_test_source(tx, path.to_str().unwrap().to_owned());
+
+        let result = recv_frame(&mut rx).await;
+        assert!(matches!(result, Err(broadcast::error::RecvError::Closed)));
     }
 }

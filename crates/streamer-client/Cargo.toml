@@ -16,3 +16,4 @@ webrtc  = { workspace = true }
 rtc = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
+bytes = { workspace = true }
