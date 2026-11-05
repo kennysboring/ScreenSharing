@@ -43,7 +43,7 @@ pub struct EncodedFrame {
     pub timed: bool,
 }
 
-const TEST_VIDEO_PATH: &str = "test-assets/test.h264";
+pub const TEST_VIDEO_PATH: &str = "test-assets/test.h264";
 const H26X_FRAME_DURATION: Duration = Duration::from_millis(33);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -185,7 +185,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_video_missing_file_fails() {
-        let (_sdp, session) = make_offer().await.expect("should create offer");
+        let (frames_tx, _) = broadcast::channel(1);
+        let (_sdp, session) = make_offer(frames_tx).await.expect("should create offer");
         let path = temp_file_path("missing.h264");
 
         let result = stream_video(path.to_str().unwrap(), session.track.clone(), 102).await;
@@ -196,7 +197,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_video_empty_file_ends_ok() {
-        let (_sdp, session) = make_offer().await.expect("should create offer");
+        let (frames_tx, _) = broadcast::channel(1);
+        let (_sdp, session) = make_offer(frames_tx).await.expect("should create offer");
         let path = temp_file_path("empty.h264");
         std::fs::write(&path, []).expect("should create empty file");
 

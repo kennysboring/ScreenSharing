@@ -15,11 +15,17 @@ use std::{
     process::ExitCode,
     sync::{Arc, Mutex},
 };
+use tokio::sync::broadcast;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Error::Http, Message},
 };
+use video::{EncodedFrame, TEST_VIDEO_PATH, start_test_source};
 use webrtc::peer_connection::RTCIceCandidateInit;
+
+/// Frames the source can be ahead of the slowest session before that session lags
+/// (about 1 s at 30 fps). A lagging session drops frames and waits for the next keyframe.
+const FRAME_CHANNEL_CAPACITY: usize = 30;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -83,6 +89,10 @@ async fn main() -> ExitCode {
 
     let (mut split_sink, mut split_stream) = ws_stream.split();
 
+    // No session listens yet, so the first receiver is dropped: sessions subscribe later
+    let (frames_tx, _) = broadcast::channel(FRAME_CHANNEL_CAPACITY);
+    start_test_source(frames_tx.clone(), TEST_VIDEO_PATH.to_owned());
+
     let mut sessions: HashMap<ViewerId, Session> = HashMap::new();
     while let Some(message) = split_stream.next().await {
         let text = match message {
@@ -120,7 +130,7 @@ async fn main() -> ExitCode {
         } //.lock out
 
         if let Some(viewer_id) = joined {
-            let Some(offer_json) = start_session(viewer_id, &mut sessions).await else {
+            let Some(offer_json) = start_session(viewer_id, &mut sessions, &frames_tx).await else {
                 continue;
             };
             if split_sink
@@ -170,8 +180,9 @@ async fn handle_viewer_signal(msg: &ServerToHost, sessions: &mut HashMap<ViewerI
 async fn start_session(
     viewer_id: ViewerId,
     sessions: &mut HashMap<ViewerId, Session>,
+    frames_tx: &broadcast::Sender<EncodedFrame>,
 ) -> Option<String> {
-    let (sdp, session) = match make_offer().await {
+    let (sdp, session) = match make_offer(frames_tx.clone()).await {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("Error: {e}");

@@ -1,6 +1,6 @@
 //! WebRTC session with one viewer: creates the offer, applies the answer and the ICE candidates.
 
-use crate::video;
+use crate::video::{self, EncodedFrame};
 use rtc::{
     interceptor::Registry,
     media_stream::MediaStreamTrack,
@@ -14,7 +14,10 @@ use rtc::{
     },
 };
 use std::{sync::Arc, time::Instant};
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::{
+    broadcast,
+    mpsc::{Receiver, Sender, channel},
+};
 use webrtc::{
     media_stream::track_local::{TrackLocal, static_sample::TrackLocalStaticSample},
     peer_connection::{
@@ -48,6 +51,8 @@ pub struct Session {
     pub answered: bool,
     pub pending: Vec<RTCIceCandidateInit>,
     pub connected_rx: Option<Receiver<()>>,
+    /// The shared frame source. The session subscribes to it once the connection is up.
+    pub frames_tx: broadcast::Sender<EncodedFrame>,
 }
 
 impl Session {
@@ -88,7 +93,9 @@ impl Session {
     }
 }
 
-pub async fn make_offer() -> Result<(String, Session), Box<dyn std::error::Error>> {
+pub async fn make_offer(
+    frames_tx: broadcast::Sender<EncodedFrame>,
+) -> Result<(String, Session), Box<dyn std::error::Error>> {
     let config = RTCConfigurationBuilder::default()
         .with_ice_servers(vec![RTCIceServer {
             urls: vec!["stun:stun.l.google.com:19302".to_owned()],
@@ -158,6 +165,7 @@ pub async fn make_offer() -> Result<(String, Session), Box<dyn std::error::Error
         answered: false,
         pending: Vec::new(),
         connected_rx: Some(connected_rx),
+        frames_tx,
     };
     Ok((offer_sdp, session))
 }
@@ -182,7 +190,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_make_offer_negotiates_h264_video() {
-        let (sdp, session) = make_offer().await.expect("should create offer");
+        let (frames_tx, _) = broadcast::channel(1);
+        let (sdp, session) = make_offer(frames_tx).await.expect("should create offer");
 
         assert!(sdp.contains("m=video"));
         assert!(sdp.contains("H264/90000"));
@@ -196,7 +205,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_make_offer_track_has_ssrc() {
-        let (_sdp, session) = make_offer().await.expect("should create offer");
+        let (frames_tx, _) = broadcast::channel(1);
+        let (_sdp, session) = make_offer(frames_tx).await.expect("should create offer");
 
         let ssrcs = session.track.ssrcs().await;
         assert_eq!(ssrcs.len(), 1);
@@ -206,7 +216,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_negotiated_payload_type_uses_registered_h264() {
-        let (_sdp, session) = make_offer().await.expect("should create offer");
+        let (frames_tx, _) = broadcast::channel(1);
+        let (_sdp, session) = make_offer(frames_tx).await.expect("should create offer");
 
         let payload_type = negotiated_payload_type(&session.sender)
             .await
