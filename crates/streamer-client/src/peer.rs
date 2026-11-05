@@ -56,8 +56,8 @@ pub struct Session {
 }
 
 impl Session {
-    /// Applies the viewer's answer, starts the test video and adds the ICE candidates that
-    /// arrived before the answer.
+    /// Applies the viewer's answer, starts sending the shared video and adds the ICE candidates
+    /// that arrived before the answer.
     pub async fn apply_answer(&mut self, sdp: &str) {
         let Ok(desc) = RTCSessionDescription::answer(sdp.to_owned()) else {
             return;
@@ -69,7 +69,12 @@ impl Session {
 
                 if let Ok(payload_type) = negotiated_payload_type(&self.sender).await {
                     if let Some(rx) = self.connected_rx.take() {
-                        video::start_test_video(self.track.clone(), payload_type, rx);
+                        video::start_session_video(
+                            self.track.clone(),
+                            payload_type,
+                            rx,
+                            self.frames_tx.clone(),
+                        );
                     }
                 } else {
                     println!("no codec negotiated");
