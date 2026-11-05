@@ -14,6 +14,7 @@ use rtc::{
     },
 };
 use std::{sync::Arc, time::Instant};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use webrtc::{
     media_stream::track_local::{TrackLocal, static_sample::TrackLocalStaticSample},
     peer_connection::{
@@ -25,12 +26,17 @@ use webrtc::{
 };
 
 #[derive(Clone)]
-struct Handler;
+struct Handler {
+    connected_tx: Sender<()>,
+}
 
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for Handler {
     async fn on_ice_candidate(&self, _event: RTCPeerConnectionIceEvent) {}
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        if state == RTCPeerConnectionState::Connected {
+            let _ = self.connected_tx.try_send(());
+        }
         println!("connection state: {state}");
     }
 }
@@ -41,6 +47,7 @@ pub struct Session {
     pub sender: Arc<dyn RtpSender>,
     pub answered: bool,
     pub pending: Vec<RTCIceCandidateInit>,
+    pub connected_rx: Option<Receiver<()>>,
 }
 
 impl Session {
@@ -56,7 +63,9 @@ impl Session {
                 self.answered = true;
 
                 if let Ok(payload_type) = negotiated_payload_type(&self.sender).await {
-                    video::start_test_video(self.track.clone(), payload_type);
+                    if let Some(rx) = self.connected_rx.take() {
+                        video::start_test_video(self.track.clone(), payload_type, rx);
+                    }
                 } else {
                     println!("no codec negotiated");
                 }
@@ -103,9 +112,11 @@ pub async fn make_offer() -> Result<(String, Session), Box<dyn std::error::Error
     media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
+    let (connected_tx, connected_rx) = channel::<()>(1);
+
     let pc = PeerConnectionBuilder::new()
         .with_configuration(config)
-        .with_handler(Arc::new(Handler))
+        .with_handler(Arc::new(Handler { connected_tx }))
         .with_udp_addrs(vec!["0.0.0.0:0"])
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
@@ -146,6 +157,7 @@ pub async fn make_offer() -> Result<(String, Session), Box<dyn std::error::Error
         sender,
         answered: false,
         pending: Vec::new(),
+        connected_rx: Some(connected_rx),
     };
     Ok((offer_sdp, session))
 }

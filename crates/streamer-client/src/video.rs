@@ -10,21 +10,32 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::time::interval;
+use tokio::{sync::mpsc::Receiver, time::interval};
 use webrtc::media_stream::{Track, track_local::static_sample::TrackLocalStaticSample};
 
 const TEST_VIDEO_PATH: &str = "test-assets/test.h264";
 const H26X_FRAME_DURATION: Duration = Duration::from_millis(33);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Starts sending the test video in the background, 2 seconds from now.
-pub fn start_test_video(track: Arc<TrackLocalStaticSample>, payload_type: PayloadType) {
+/// Starts sending the test video in the background once the connection is up, giving up if it
+/// does not connect within `CONNECT_TIMEOUT`.
+pub fn start_test_video(
+    track: Arc<TrackLocalStaticSample>,
+    payload_type: PayloadType,
+    mut connected_rx: Receiver<()>,
+) {
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        if stream_video(TEST_VIDEO_PATH, track, payload_type)
-            .await
-            .is_err()
-        {
-            println!("Error streaming video");
+        match tokio::time::timeout(CONNECT_TIMEOUT, connected_rx.recv()).await {
+            Ok(Some(())) => {
+                if stream_video(TEST_VIDEO_PATH, track, payload_type)
+                    .await
+                    .is_err()
+                {
+                    println!("Error streaming video");
+                }
+            }
+            Ok(None) => println!("Connection closed before it was established"),
+            Err(_) => println!("Connection timed out while waiting to connect"),
         }
     });
 }
