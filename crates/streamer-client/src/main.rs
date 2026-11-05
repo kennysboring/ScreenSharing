@@ -5,21 +5,45 @@ use reqwest::{
     Client, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
 };
+use rtc::{
+    interceptor::Registry,
+    media::{Sample, io::h26x_reader::H26xSampleReader},
+    media_stream::MediaStreamTrack,
+    peer_connection::configuration::media_engine::MIME_TYPE_H264,
+    rtp_transceiver::{
+        PayloadType,
+        rtp_sender::{
+            RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
+            RtpCodecKind,
+        },
+    },
+};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     env::args,
+    fs::File,
+    io::BufReader,
     process::ExitCode,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
+use tokio::time::interval;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Error::Http, Message, client::IntoClientRequest, handshake::client::Request},
 };
-use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceCandidateInit, RTCIceServer, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
-    RTCSessionDescription,
+use webrtc::{
+    media_stream::{
+        Track,
+        track_local::{TrackLocal, static_sample::TrackLocalStaticSample},
+    },
+    peer_connection::{
+        MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+        RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer, RTCPeerConnectionIceEvent,
+        RTCPeerConnectionState, RTCSessionDescription, register_default_interceptors,
+    },
+    rtp_transceiver::RtpSender,
 };
 
 #[derive(Clone)]
@@ -35,6 +59,8 @@ impl PeerConnectionEventHandler for Handler {
 
 struct Session {
     pc: Arc<dyn PeerConnection>,
+    track: Arc<TrackLocalStaticSample>,
+    sender: Arc<dyn RtpSender>,
     answered: bool,
     pending: Vec<RTCIceCandidateInit>,
 }
@@ -70,10 +96,6 @@ async fn main() -> ExitCode {
     if let Err(msg) = validate_addr(&addr) {
         eprintln!("{msg}");
         return ExitCode::FAILURE;
-    }
-
-    if let Err(e) = make_offer().await {
-        eprintln!("Error to create the offer: {e}");
     }
 
     let panel: SharedPanel = Arc::new(Mutex::new(Panel {
@@ -151,6 +173,23 @@ async fn main() -> ExitCode {
                         Ok(_) => {
                             println!("answer applied");
                             session.answered = true;
+
+                            if let Ok(payload_type) = negotiated_payload_type(&session.sender).await
+                            {
+                                let track = session.track.clone(); // uma cópia, porque a task vive mais que este bloco
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    if stream_video("test-assets/teste.h264", track, payload_type)
+                                        .await
+                                        .is_err()
+                                    {
+                                        println!("Error stream video");
+                                    }
+                                });
+                            } else {
+                                println!("no codec negociated");
+                            }
+
                             for candidate in std::mem::take(&mut session.pending) {
                                 let _ = session.pc.add_ice_candidate(candidate).await;
                             }
@@ -205,22 +244,15 @@ async fn main() -> ExitCode {
                 } //.lock out
 
                 if let Some(viewer_id) = joined {
-                    let (sdp, pc) = match make_offer().await {
-                        Ok((sdp, pc)) => (sdp, pc),
+                    let (sdp, session) = match make_offer().await {
+                        Ok(pair) => pair,
                         Err(e) => {
                             eprintln!("Error: {e}");
                             continue;
                         }
                     };
 
-                    sessions.insert(
-                        viewer_id,
-                        Session {
-                            pc,
-                            answered: false,
-                            pending: Vec::new(),
-                        },
-                    );
+                    sessions.insert(viewer_id, session);
                     println!("sessões ativas: {}", sessions.len());
 
                     let reply = HostToServer::SignalToViewer {
@@ -336,7 +368,7 @@ fn apply_server_message(panel: &mut Panel, msg: ServerToHost) {
     }
 }
 
-async fn make_offer() -> Result<(String, Arc<dyn PeerConnection>), Box<dyn std::error::Error>> {
+async fn make_offer() -> Result<(String, Session), Box<dyn std::error::Error>> {
     let config = RTCConfigurationBuilder::default()
         .with_ice_servers(vec![RTCIceServer {
             urls: vec!["stun:stun.l.google.com:19302".to_owned()],
@@ -344,22 +376,124 @@ async fn make_offer() -> Result<(String, Arc<dyn PeerConnection>), Box<dyn std::
         }])
         .build();
 
+    let video_codec = RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                .to_owned(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: 102,
+    };
+
+    let mut media_engine = MediaEngine::default();
+    media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+
     let pc = PeerConnectionBuilder::new()
         .with_configuration(config)
         .with_handler(Arc::new(Handler))
         .with_udp_addrs(vec!["0.0.0.0:0"])
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
         .build()
         .await?;
 
-    let pc: Arc<dyn PeerConnection> = Arc::new(pc);
+    let ssrc = rand::random::<u32>();
+    let track = Arc::new(TrackLocalStaticSample::new(
+        Instant::now(),
+        MediaStreamTrack::new(
+            "stream".to_string(),
+            "track".to_string(),
+            "label".to_string(),
+            RtpCodecKind::Video,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    ssrc: Some(ssrc),
+                    ..Default::default()
+                },
+                codec: video_codec.rtp_codec.clone(),
+                ..Default::default()
+            }],
+        ),
+    )?);
 
-    let _dc = pc.create_data_channel("probe", None).await?;
+    let pc: Arc<dyn PeerConnection> = Arc::new(pc);
+    let sender = pc
+        .add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
+        .await?;
 
     let offer = pc.create_offer(None).await?;
     let offer_sdp = offer.sdp.clone();
     pc.set_local_description(offer).await?;
 
-    Ok((offer_sdp, pc))
+    let session: Session = Session {
+        pc,
+        track,
+        sender,
+        answered: false,
+        pending: Vec::new(),
+    };
+    Ok((offer_sdp, session))
+}
+
+async fn negotiated_payload_type(
+    sender: &Arc<dyn RtpSender>,
+) -> Result<PayloadType, Box<dyn std::error::Error>> {
+    sender
+        .get_parameters()
+        .await?
+        .rtp_parameters
+        .codecs
+        .first()
+        .map(|codec| codec.payload_type)
+        .ok_or_else(|| "sender has no codec".into())
+}
+
+const H26X_FRAME_DURATION: Duration = Duration::from_millis(33);
+
+async fn stream_video(
+    path: &str,
+    track: Arc<TrackLocalStaticSample>,
+    payload_type: PayloadType,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut video_reader = H26xSampleReader::new(reader, 1_048_576, false);
+
+    let ssrc = *track.ssrcs().await.first().ok_or("track without ssrc")?;
+
+    let mut ticker = interval(H26X_FRAME_DURATION);
+    loop {
+        let sample = match video_reader.next_sample() {
+            Ok(sample) => sample,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                break;
+            }
+        };
+
+        track
+            .sample_writer(ssrc, payload_type)
+            .write_sample(&Sample {
+                data: sample.data,
+                duration: if sample.timed {
+                    H26X_FRAME_DURATION
+                } else {
+                    Duration::ZERO
+                },
+                ..Sample::new(Instant::now())
+            })
+            .await?;
+
+        if sample.timed {
+            let _ = ticker.tick().await;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
