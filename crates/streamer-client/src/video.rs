@@ -13,6 +13,28 @@ use std::{
 use tokio::{sync::mpsc::Receiver, time::interval};
 use webrtc::media_stream::{Track, track_local::static_sample::TrackLocalStaticSample};
 
+#[derive(Default)]
+pub struct KeyframeGate {
+    open: bool,
+}
+
+impl KeyframeGate {
+    pub fn should_send(&mut self, nal: Option<u8>) -> bool {
+        if nal.is_none() {
+            return false;
+        }
+        if self.open || nal == Some(7) {
+            self.open = true;
+            return true;
+        }
+        false
+    }
+
+    pub fn wait_for_keyframe(&mut self) {
+        self.open = false
+    }
+}
+
 const TEST_VIDEO_PATH: &str = "test-assets/test.h264";
 const H26X_FRAME_DURATION: Duration = Duration::from_millis(33);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -135,5 +157,66 @@ mod tests {
         assert_eq!(nal_type(&[0x25]), Some(5)); // IDR with a different nal_ref_idc
         assert_eq!(nal_type(&[0x06]), Some(6)); // SEI
         assert_eq!(nal_type(&[]), None);
+    }
+
+    /// Feeds each NAL type through the gate and returns what it decided for each one.
+    fn feed(gate: &mut KeyframeGate, nals: &[u8]) -> Vec<bool> {
+        nals.iter()
+            .map(|&nal| gate.should_send(Some(nal)))
+            .collect()
+    }
+
+    #[test]
+    fn test_keyframe_gate_opens_on_sps() {
+        let mut gate = KeyframeGate::default();
+        assert_eq!(
+            feed(&mut gate, &[1, 1, 7, 8, 5, 1]),
+            [false, false, true, true, true, true]
+        );
+    }
+
+    #[test]
+    fn test_keyframe_gate_idr_without_sps_stays_closed() {
+        // Without the SPS/PPS headers the browser cannot decode the IDR
+        let mut gate = KeyframeGate::default();
+        assert_eq!(feed(&mut gate, &[5, 5]), [false, false]);
+    }
+
+    #[test]
+    fn test_keyframe_gate_wait_for_keyframe_closes_again() {
+        let mut gate = KeyframeGate::default();
+        assert_eq!(feed(&mut gate, &[7, 1]), [true, true]);
+
+        gate.wait_for_keyframe();
+
+        assert_eq!(feed(&mut gate, &[1, 7, 1]), [false, true, true]);
+    }
+
+    #[test]
+    fn test_keyframe_gate_idr_after_close_needs_sps() {
+        // Even right after an IDR, once closed only an SPS opens the gate again
+        let mut gate = KeyframeGate::default();
+        assert_eq!(feed(&mut gate, &[7, 8, 5]), [true, true, true]);
+
+        gate.wait_for_keyframe();
+
+        assert_eq!(feed(&mut gate, &[5, 1, 7]), [false, false, true]);
+    }
+
+    #[test]
+    fn test_keyframe_gate_none_is_never_sent() {
+        let mut gate = KeyframeGate::default();
+        assert!(!gate.should_send(None), "closed gate");
+
+        assert!(gate.should_send(Some(7)));
+        assert!(!gate.should_send(None), "open gate");
+        // An empty sample does not close the gate
+        assert!(gate.should_send(Some(1)));
+    }
+
+    #[test]
+    fn test_keyframe_gate_starts_closed() {
+        let mut gate = KeyframeGate::default();
+        assert!(!gate.should_send(Some(1)));
     }
 }
