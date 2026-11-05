@@ -76,7 +76,7 @@ async fn main() {
 }
 
 async fn health_check() -> &'static str {
-    "vivo"
+    "alive"
 }
 
 const MAX_ROOMS: usize = 10;
@@ -163,7 +163,7 @@ async fn web_socket_upgrade_host(
     state: SharedState,
     room_id: String,
 ) {
-    println!("WebSocket estabelecido");
+    println!("WebSocket established");
 
     let (mut sink, mut stream) = socket.split();
 
@@ -259,7 +259,7 @@ async fn web_socket_upgrade_viewer(
     state: SharedState,
     room_id: String,
 ) {
-    println!("viewer conectou");
+    println!("viewer connected");
 
     let (mut sink, mut stream) = socket.split();
 
@@ -427,7 +427,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         let valid_token = Uuid::new_v4();
 
-        // Envia apenas o UUID sem o prefixo "Bearer "
+        // Send only the UUID, without the "Bearer " prefix
         headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&valid_token.to_string()).unwrap(),
@@ -440,10 +440,10 @@ mod tests {
     fn test_extract_token_invalid_uuid_after_bearer() {
         let mut headers = HeaderMap::new();
 
-        // Prefixo "Bearer " correto, mas conteúdo não é um UUID válido
+        // Correct "Bearer " prefix, but the content is not a valid UUID
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_static("Bearer lixo-invalido-123"),
+            HeaderValue::from_static("Bearer garbage-invalid-123"),
         );
 
         assert_eq!(extract_token(&headers), None);
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_extract_token_missing_header() {
-        // HeaderMap completamente vazio (sem Authorization)
+        // Completely empty HeaderMap (no Authorization)
         let headers = HeaderMap::new();
 
         assert_eq!(extract_token(&headers), None);
@@ -461,11 +461,11 @@ mod tests {
     fn test_extract_token_bearer_without_token() {
         let mut headers = HeaderMap::new();
 
-        // "Bearer " com espaço mas sem token
+        // "Bearer " with a space but no token
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer "));
         assert_eq!(extract_token(&headers), None);
 
-        // Apenas "Bearer" sem espaço nem token
+        // Just "Bearer", with no space and no token
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer"));
         assert_eq!(extract_token(&headers), None);
     }
@@ -475,7 +475,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         let valid_token = Uuid::new_v4();
 
-        // "bearer " em minúsculas (a implementação atual exige "Bearer " com B maiúsculo)
+        // Lowercase "bearer " (the current implementation requires "Bearer " with a capital B)
         headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("bearer {valid_token}")).unwrap(),
@@ -488,7 +488,7 @@ mod tests {
     fn test_extract_token_non_ascii_header_value() {
         let mut headers = HeaderMap::new();
 
-        // Bytes arbitrários não-ASCII fazem authorization.to_str() retornar Err
+        // Arbitrary non-ASCII bytes make authorization.to_str() return Err
         let non_ascii_bytes = b"Bearer \xFF\xFE\xFD";
         let invalid_header = HeaderValue::from_bytes(non_ascii_bytes).unwrap();
         headers.insert(AUTHORIZATION, invalid_header);
@@ -509,13 +509,13 @@ mod tests {
     #[test]
     fn test_remove_expired_rooms_absent_beyond_grace() {
         let mut rooms = HashMap::new();
-        let desde = Instant::now();
+        let since = Instant::now();
         let grace = HOST_ABSENCE_GRACE;
 
-        rooms.insert("room1".to_string(), room_with(Some(desde)));
+        rooms.insert("room1".to_string(), room_with(Some(since)));
 
-        // Ausente além da tolerância (1 segundo a mais)
-        let now = desde + grace + Duration::from_secs(1);
+        // Absent beyond the grace period (1 second more)
+        let now = since + grace + Duration::from_secs(1);
         remove_expired_rooms(&mut rooms, now, grace);
 
         assert!(rooms.is_empty());
@@ -524,13 +524,13 @@ mod tests {
     #[test]
     fn test_remove_expired_rooms_absent_within_grace() {
         let mut rooms = HashMap::new();
-        let desde = Instant::now();
+        let since = Instant::now();
         let grace = HOST_ABSENCE_GRACE;
 
-        rooms.insert("room1".to_string(), room_with(Some(desde)));
+        rooms.insert("room1".to_string(), room_with(Some(since)));
 
-        // Ausente menos que a tolerância
-        let now = desde + Duration::from_secs(100);
+        // Absent for less than the grace period
+        let now = since + Duration::from_secs(100);
         remove_expired_rooms(&mut rooms, now, grace);
 
         assert_eq!(rooms.len(), 1);
@@ -540,14 +540,14 @@ mod tests {
     #[test]
     fn test_remove_expired_rooms_host_present() {
         let mut rooms = HashMap::new();
-        let desde = Instant::now();
+        let since = Instant::now();
         let grace = HOST_ABSENCE_GRACE;
 
-        // Host presente (host_absent_since = None)
+        // Host present (host_absent_since = None)
         rooms.insert("room1".to_string(), room_with(None));
 
-        // Mesmo com `now` muito no futuro (ex: 100 horas depois)
-        let now = desde + Duration::from_secs(360_000);
+        // Even with `now` far in the future (e.g. 100 hours later)
+        let now = since + Duration::from_secs(360_000);
         remove_expired_rooms(&mut rooms, now, grace);
 
         assert_eq!(rooms.len(), 1);
@@ -557,42 +557,42 @@ mod tests {
     #[test]
     fn test_remove_expired_rooms_exact_boundary_and_transition() {
         let mut rooms = HashMap::new();
-        let desde = Instant::now();
+        let since = Instant::now();
         let grace = HOST_ABSENCE_GRACE;
 
-        // 1. Instante imediatamente anterior à tolerância (now = desde + grace - 1 ns): deve manter
-        rooms.insert("room1".to_string(), room_with(Some(desde)));
-        let now_before = desde + grace - Duration::from_nanos(1);
+        // 1. Instant right before the grace period ends (now = since + grace - 1 ns): must keep
+        rooms.insert("room1".to_string(), room_with(Some(since)));
+        let now_before = since + grace - Duration::from_nanos(1);
         remove_expired_rooms(&mut rooms, now_before, grace);
         assert_eq!(
             rooms.len(),
             1,
-            "A sala deveria ser mantida 1ns antes de atingir a tolerância exata"
+            "The room should be kept 1ns before reaching the exact grace period"
         );
 
-        // 2. Fronteira exata (now = desde + grace): com '<', o delta é igual ao limit, resultando em false -> removida
-        let now_exact = desde + grace;
+        // 2. Exact boundary (now = since + grace): with '<', the delta equals the limit, giving false -> removed
+        let now_exact = since + grace;
         remove_expired_rooms(&mut rooms, now_exact, grace);
         assert!(
             rooms.is_empty(),
-            "A sala deveria ser removida no instante exato da tolerância (now == desde + grace)"
+            "The room should be removed at the exact end of the grace period (now == since + grace)"
         );
     }
 
     #[test]
     fn test_remove_expired_rooms_isolates_expired_entry() {
         let mut rooms = HashMap::new();
-        let desde = Instant::now();
+        let since = Instant::now();
         let grace = HOST_ABSENCE_GRACE;
 
-        // Sala 1: ausente desde 'desde' (vai expirar no tempo 'now')
-        rooms.insert("expired_room".to_string(), room_with(Some(desde)));
+        // Room 1: absent since `since` (expires at `now`)
+        rooms.insert("expired_room".to_string(), room_with(Some(since)));
 
-        // Sala 2: ausente mais recentemente (permanecerá válida)
-        let recente = desde + Duration::from_secs(100);
-        rooms.insert("valid_room".to_string(), room_with(Some(recente)));
+        // Room 2: absent more recently (will stay valid)
+        let recent = since + Duration::from_secs(100);
+        rooms.insert("valid_room".to_string(), room_with(Some(recent)));
 
-        let now = desde + grace;
+        let now = since + grace;
         remove_expired_rooms(&mut rooms, now, grace);
 
         assert_eq!(rooms.len(), 1);
@@ -714,7 +714,7 @@ mod tests {
         let (host_tx, mut host_rx) = channel::<ServerToHost>(8);
         let (viewer_tx, mut viewer_rx) = channel::<ServerToViewer>(1);
 
-        // Enche o canal antes de entregar o Sender à sala
+        // Fill the channel before handing the Sender to the room
         viewer_tx
             .try_send(ServerToViewer::HostUnavailable)
             .expect("should fill viewer channel");
@@ -726,14 +726,14 @@ mod tests {
 
         assert!(result);
 
-        // Verifica que o mapa de viewers está vazio (em escopo curto)
+        // Check that the viewers map is empty (in a short scope)
         {
             let guard = state.lock().unwrap();
             let room = guard.0.get("room").expect("room should exist");
             assert!(room.viewers.is_empty(), "viewer should have been removed");
         }
 
-        // Host recebe ViewerLeft { viewer_id: ViewerId(0) }
+        // Host receives ViewerLeft { viewer_id: ViewerId(0) }
         let host_msg = host_rx
             .try_recv()
             .expect("host should receive ViewerLeft notification");
@@ -744,7 +744,7 @@ mod tests {
             }
         );
 
-        // Canal do viewer continha a mensagem inicial com que foi preenchido
+        // The viewer channel held the initial message it was filled with
         assert_eq!(
             viewer_rx.try_recv().unwrap(),
             ServerToViewer::HostUnavailable
@@ -771,8 +771,8 @@ mod tests {
     fn test_register_host_with_viewers() {
         let mut room = room_with(None);
 
-        // Insere cinco viewers (0 a 4). Como a ordem de iteração do HashMap é não determinística,
-        // uma amostra com 5 elementos reduz a chance de ordenação acidental a 1 em 120 (1/5!).
+        // Insert five viewers (0 to 4). Since HashMap iteration order is not deterministic,
+        // a sample of 5 elements lowers the chance of accidental ordering to 1 in 120 (1/5!).
         for id in [3, 0, 4, 1, 2] {
             let (tx, _rx) = channel(1);
             room.viewers.insert(ViewerId(id), tx);
@@ -780,7 +780,7 @@ mod tests {
 
         let (mut rx, _id) = register_host(&mut room);
 
-        let msg = rx.try_recv().expect("deve receber ViewerList");
+        let msg = rx.try_recv().expect("should receive ViewerList");
         assert_eq!(
             msg,
             ServerToHost::ViewerList {
@@ -801,13 +801,13 @@ mod tests {
 
         let (mut rx, _id) = register_host(&mut room);
 
-        let msg = rx.try_recv().expect("deve receber ViewerList vazia");
+        let msg = rx.try_recv().expect("should receive an empty ViewerList");
         assert_eq!(msg, ServerToHost::ViewerList { viewers: vec![] });
     }
 
     #[test]
     fn test_register_host_state() {
-        // Começa com Some(Instant::now()) para provar que a função o zera
+        // Start with Some(Instant::now()) to prove the function clears it
         let mut room = room_with(Some(Instant::now()));
         assert!(room.host.is_none());
         assert!(room.host_absent_since.is_some());
@@ -830,13 +830,13 @@ mod tests {
         assert_ne!(id1, id2);
         assert!(matches!(&room.host, Some(h) if h.id == id2));
 
-        // O primeiro receptor ainda entrega a mensagem que estava na fila
+        // The first receiver still delivers the message that was queued
         let msg = rx1
             .try_recv()
-            .expect("primeiro receptor deve entregar mensagem na fila");
+            .expect("first receiver should deliver the queued message");
         assert_eq!(msg, ServerToHost::ViewerList { viewers: vec![] });
 
-        // E só depois devolve TryRecvError::Disconnected porque o sender antigo foi dropado
+        // Only then does it return TryRecvError::Disconnected, because the old sender was dropped
         assert_eq!(rx1.try_recv(), Err(TryRecvError::Disconnected));
     }
 }

@@ -100,10 +100,10 @@ mod tests {
     #[test]
     fn test_offer_serialization_and_deserialization() {
         let msg = SignalMessage::Offer {
-            sdp: "teste".to_string(),
+            sdp: "test".to_string(),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"offer","sdp":"teste"}"#);
+        assert_eq!(json, r#"{"type":"offer","sdp":"test"}"#);
 
         let deserialized: SignalMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, msg);
@@ -112,10 +112,10 @@ mod tests {
     #[test]
     fn test_answer_serialization_and_deserialization() {
         let msg = SignalMessage::Answer {
-            sdp: "teste".to_string(),
+            sdp: "test".to_string(),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"answer","sdp":"teste"}"#);
+        assert_eq!(json, r#"{"type":"answer","sdp":"test"}"#);
 
         let deserialized: SignalMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, msg);
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_ice_optional_fields_as_explicit_null() {
-        // O navegador web frequentemente envia "sdpMid": null ou "usernameFragment": null
+        // Web browsers often send "sdpMid": null or "usernameFragment": null
         let json = r#"{
             "type": "ice",
             "candidate": "candidate:1",
@@ -159,13 +159,13 @@ mod tests {
             username_fragment: None,
         };
 
-        // Option desserializa JSON `null` como `None`
+        // Option deserializes JSON `null` as `None`
         assert_eq!(deserialized, expected);
     }
 
     #[test]
     fn test_ice_optional_fields_omitted() {
-        // Campos ausentes no JSON também são desserializados como `None`
+        // Fields missing from the JSON are also deserialized as `None`
         let json = r#"{
             "type": "ice",
             "candidate": "candidate:1"
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_ice_serialization_skips_none_fields() {
-        // Quando campos são None, skip_serializing_if faz com que não apareçam no JSON gerado
+        // When fields are None, skip_serializing_if keeps them out of the generated JSON
         let msg = SignalMessage::Ice {
             candidate: "candidate:1".to_string(),
             sdp_mid: None,
@@ -205,12 +205,12 @@ mod tests {
 
     #[test]
     fn test_deserialize_missing_required_field() {
-        // Falta campo obrigatório `sdp` em offer
+        // Required field `sdp` missing from offer
         let json_offer_no_sdp = r#"{"type":"offer"}"#;
         let result_offer = serde_json::from_str::<SignalMessage>(json_offer_no_sdp);
         assert!(result_offer.is_err());
 
-        // Falta campo obrigatório `candidate` em ice
+        // Required field `candidate` missing from ice
         let json_ice_no_candidate = r#"{"type":"ice"}"#;
         let result_ice = serde_json::from_str::<SignalMessage>(json_ice_no_candidate);
         assert!(result_ice.is_err());
@@ -218,13 +218,13 @@ mod tests {
 
     #[test]
     fn test_deserialize_ignores_unknown_fields() {
-        // O Serde ignora campos não mapeados por padrão (decisão de protocolo tolerante à evolução)
-        let json = r#"{"type":"offer","sdp":"teste","novo":1,"extra":{"nested":true}}"#;
+        // Serde ignores unmapped fields by default (a protocol choice that tolerates evolution)
+        let json = r#"{"type":"offer","sdp":"test","new":1,"extra":{"nested":true}}"#;
         let deserialized = serde_json::from_str::<SignalMessage>(json);
         assert_eq!(
             deserialized.unwrap(),
             SignalMessage::Offer {
-                sdp: "teste".to_string()
+                sdp: "test".to_string()
             }
         );
     }
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn test_viewer_id_transparent_serialization_and_deserialization() {
         let viewer_id = ViewerId(42);
-        // Newtype struct serializa diretamente como o número `42`
+        // A newtype struct serializes directly as the number `42`
         let json = serde_json::to_string(&viewer_id).unwrap();
         assert_eq!(json, "42");
 
@@ -242,18 +242,18 @@ mod tests {
 
     #[test]
     fn test_viewer_id_boundaries_and_invalid_deserialization() {
-        // Valores válidos no limite de u32
+        // Valid values at the u32 bounds
         assert_eq!(serde_json::from_str::<ViewerId>("0").unwrap(), ViewerId(0));
         assert_eq!(
             serde_json::from_str::<ViewerId>("4294967295").unwrap(),
             ViewerId(u32::MAX)
         );
 
-        // String em vez de inteiro deve falhar
+        // A string instead of an integer must fail
         assert!(serde_json::from_str::<ViewerId>(r#""42""#).is_err());
-        // Overflow de u32 (> 4_294_967_295) deve falhar
+        // u32 overflow (> 4_294_967_295) must fail
         assert!(serde_json::from_str::<ViewerId>("4294967296").is_err());
-        // Número negativo deve falhar para tipo unsigned
+        // A negative number must fail for an unsigned type
         assert!(serde_json::from_str::<ViewerId>("-1").is_err());
     }
 
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_server_to_host_viewer_list_serialization_and_deserialization() {
-        // Lista com elementos
+        // List with elements
         let msg = ServerToHost::ViewerList {
             viewers: vec![ViewerId(1), ViewerId(2), ViewerId(3)],
         };
@@ -311,7 +311,7 @@ mod tests {
         let deserialized: ServerToHost = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, msg);
 
-        // Lista vazia
+        // Empty list
         let empty_msg = ServerToHost::ViewerList { viewers: vec![] };
         let empty_json = serde_json::to_string(&empty_msg).unwrap();
         assert_eq!(empty_json, r#"{"type":"viewerList","viewers":[]}"#);
@@ -328,19 +328,19 @@ mod tests {
 
     #[test]
     fn test_server_to_host_deserialize_missing_fields() {
-        // Sem viewerId em ViewerJoined
+        // No viewerId in ViewerJoined
         let json_no_viewer_id = r#"{"type":"viewerJoined"}"#;
         assert!(serde_json::from_str::<ServerToHost>(json_no_viewer_id).is_err());
 
-        // Sem message em SignalFromViewer
+        // No message in SignalFromViewer
         let json_no_message = r#"{"type":"signalFromViewer","from":1}"#;
         assert!(serde_json::from_str::<ServerToHost>(json_no_message).is_err());
 
-        // Sem viewers em ViewerList
+        // No viewers in ViewerList
         let json_no_viewers = r#"{"type":"viewerList"}"#;
         assert!(serde_json::from_str::<ServerToHost>(json_no_viewers).is_err());
 
-        // Sem a tag type
+        // No type tag
         let json_no_type = r#"{"viewerId":1}"#;
         assert!(serde_json::from_str::<ServerToHost>(json_no_type).is_err());
     }
@@ -374,7 +374,7 @@ mod tests {
         let deserialized: HostToServer = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, msg);
 
-        // Testando com ICE candidate contendo campos opcionais
+        // Testing with an ICE candidate that has optional fields
         let ice_msg = HostToServer::SignalToViewer {
             to: ViewerId(99),
             message: SignalMessage::Ice {
@@ -402,15 +402,15 @@ mod tests {
 
     #[test]
     fn test_host_to_server_deserialize_missing_fields() {
-        // Sem message
+        // No message
         let json_no_message = r#"{"type":"signalToViewer","to":99}"#;
         assert!(serde_json::from_str::<HostToServer>(json_no_message).is_err());
 
-        // Sem to
+        // No to
         let json_no_to = r#"{"type":"signalToViewer","message":{"type":"offer","sdp":"test"}}"#;
         assert!(serde_json::from_str::<HostToServer>(json_no_to).is_err());
 
-        // Sem a tag type
+        // No type tag
         let json_no_type = r#"{"to":99,"message":{"type":"offer","sdp":"test"}}"#;
         assert!(serde_json::from_str::<HostToServer>(json_no_type).is_err());
     }
@@ -455,11 +455,11 @@ mod tests {
 
     #[test]
     fn test_viewer_to_server_deserialize_missing_fields() {
-        // Sem message
+        // No message
         let json_no_message = r#"{"type":"signalToHost"}"#;
         assert!(serde_json::from_str::<ViewerToServer>(json_no_message).is_err());
 
-        // Sem tag type
+        // No type tag
         let json_no_type = r#"{"message":{"type":"offer","sdp":"test"}}"#;
         assert!(serde_json::from_str::<ViewerToServer>(json_no_type).is_err());
     }
@@ -513,11 +513,11 @@ mod tests {
 
     #[test]
     fn test_server_to_viewer_deserialize_missing_fields() {
-        // SignalFromHost sem message
+        // SignalFromHost without message
         let json_no_message = r#"{"type":"signalFromHost"}"#;
         assert!(serde_json::from_str::<ServerToViewer>(json_no_message).is_err());
 
-        // Sem tag type
+        // No type tag
         let json_no_type = r#"{"message":{"type":"answer","sdp":"test"}}"#;
         assert!(serde_json::from_str::<ServerToViewer>(json_no_type).is_err());
     }
@@ -537,9 +537,9 @@ mod tests {
         };
 
         let json =
-            serde_json::to_string(&response).expect("falha ao serializar CreateRoomResponse");
+            serde_json::to_string(&response).expect("failed to serialize CreateRoomResponse");
         let deserialized: CreateRoomResponse =
-            serde_json::from_str(&json).expect("falha ao desserializar CreateRoomResponse");
+            serde_json::from_str(&json).expect("failed to deserialize CreateRoomResponse");
 
         assert_eq!(deserialized, response);
     }
@@ -552,8 +552,8 @@ mod tests {
         };
 
         let json =
-            serde_json::to_string(&response).expect("falha ao serializar CreateRoomResponse");
-        // Verifica o JSON exato com roomId e hostToken na ordem de declaração dos campos
+            serde_json::to_string(&response).expect("failed to serialize CreateRoomResponse");
+        // Check the exact JSON with roomId and hostToken in field declaration order
         assert_eq!(
             json,
             r#"{"roomId":"room-abc-123","hostToken":"secret-token-456"}"#
@@ -561,13 +561,13 @@ mod tests {
 
         let deserialized: CreateRoomResponse =
             serde_json::from_str(r#"{"roomId":"room-abc-123","hostToken":"secret-token-456"}"#)
-                .expect("falha ao desserializar JSON exato");
+                .expect("failed to deserialize exact JSON");
         assert_eq!(deserialized, response);
     }
 
     #[test]
     fn test_create_room_response_missing_host_token_fails() {
-        // Sem hostToken obrigatório deve falhar na desserialização
+        // Missing required hostToken must fail deserialization
         let json_without_host_token = r#"{"roomId":"room-abc-123"}"#;
         let result = serde_json::from_str::<CreateRoomResponse>(json_without_host_token);
 

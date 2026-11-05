@@ -53,7 +53,7 @@ struct Handler;
 impl PeerConnectionEventHandler for Handler {
     async fn on_ice_candidate(&self, _event: RTCPeerConnectionIceEvent) {}
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        println!("state connection: {state}");
+        println!("connection state: {state}");
     }
 }
 
@@ -92,7 +92,7 @@ type SharedPanel = Arc<Mutex<Panel>>;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let addr = args().nth(1).expect("use: streamer-client <host:porta>");
+    let addr = args().nth(1).expect("usage: streamer-client <host:port>");
     if let Err(msg) = validate_addr(&addr) {
         eprintln!("{msg}");
         return ExitCode::FAILURE;
@@ -176,25 +176,25 @@ async fn main() -> ExitCode {
 
                             if let Ok(payload_type) = negotiated_payload_type(&session.sender).await
                             {
-                                let track = session.track.clone(); // uma cópia, porque a task vive mais que este bloco
+                                let track = session.track.clone(); // a copy, because the task outlives this block
                                 tokio::spawn(async move {
                                     tokio::time::sleep(Duration::from_secs(2)).await;
-                                    if stream_video("test-assets/teste.h264", track, payload_type)
+                                    if stream_video("test-assets/test.h264", track, payload_type)
                                         .await
                                         .is_err()
                                     {
-                                        println!("Error stream video");
+                                        println!("Error streaming video");
                                     }
                                 });
                             } else {
-                                println!("no codec negociated");
+                                println!("no codec negotiated");
                             }
 
                             for candidate in std::mem::take(&mut session.pending) {
                                 let _ = session.pc.add_ice_candidate(candidate).await;
                             }
                         }
-                        Err(e) => println!("failure to apply the answer {e}"),
+                        Err(e) => println!("failed to apply the answer: {e}"),
                     }
                 }
 
@@ -217,7 +217,7 @@ async fn main() -> ExitCode {
                         username_fragment: username_fragment.clone(),
                         ..Default::default()
                     };
-                    // se session.answered: add_ice_candidate(init).await, senão session.pending.push(init)
+                    // if session.answered: add_ice_candidate(init).await, else session.pending.push(init)
                     if session.answered {
                         let _ = session.pc.add_ice_candidate(init).await;
                     } else {
@@ -234,7 +234,7 @@ async fn main() -> ExitCode {
                     if let Some(session) = sessions.remove(viewer_id) {
                         let _ = session.pc.close().await;
                     }
-                    println!("sessões ativas: {}", sessions.len());
+                    println!("active sessions: {}", sessions.len());
                 }
 
                 {
@@ -253,7 +253,7 @@ async fn main() -> ExitCode {
                     };
 
                     sessions.insert(viewer_id, session);
-                    println!("sessões ativas: {}", sessions.len());
+                    println!("active sessions: {}", sessions.len());
 
                     let reply = HostToServer::SignalToViewer {
                         to: viewer_id,
@@ -270,7 +270,7 @@ async fn main() -> ExitCode {
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
             Err(e) => {
-                eprintln!("Error in WebSocket messages : {e}");
+                eprintln!("WebSocket message error: {e}");
                 break;
             }
         }
@@ -288,13 +288,13 @@ async fn run_panel(panel: SharedPanel) {
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:8787").await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Error not allowed to use the port: {e}");
+            eprintln!("Error: could not bind the port: {e}");
             return;
         }
     };
 
     if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("Error axum::serve: {e}");
+        eprintln!("Error in axum::serve: {e}");
     }
 }
 
@@ -327,7 +327,7 @@ fn build_ws_request(addr: &str, room: &CreateRoomResponse) -> Result<Request, St
     let ws_url = format!("ws://{addr}/ws/host/{}", room.room_id);
     let mut request = ws_url
         .into_client_request()
-        .map_err(|e| format!("Error to create WebSocket request: {e}"))?;
+        .map_err(|e| format!("Failed to create WebSocket request: {e}"))?;
 
     let authorization_value = HeaderValue::from_str(&format!("Bearer {}", room.host_token))
         .map_err(|_| "Invalid Authorization: Bearer <token>".to_string())?;
@@ -342,7 +342,7 @@ fn build_ws_request(addr: &str, room: &CreateRoomResponse) -> Result<Request, St
 async fn create_room(client: &Client, url: &str) -> Result<CreateRoomResponse, String> {
     let response = match client.post(url).send().await {
         Ok(response) => response,
-        Err(e) => return Err(format!("Server is not working. Error = {e}")),
+        Err(e) => return Err(format!("Server is not responding. Error: {e}")),
     };
 
     match response.status() {
@@ -350,8 +350,8 @@ async fn create_room(client: &Client, url: &str) -> Result<CreateRoomResponse, S
             .json::<CreateRoomResponse>()
             .await
             .map_err(|e| format!("Error: {e}")),
-        StatusCode::SERVICE_UNAVAILABLE => Err("full rooms, try again later".to_string()),
-        other_cases => Err(format!("Error: cases do not defined: {other_cases}")),
+        StatusCode::SERVICE_UNAVAILABLE => Err("all rooms are full, try again later".to_string()),
+        other_status => Err(format!("Error: unexpected status: {other_status}")),
     }
 }
 
@@ -463,7 +463,7 @@ async fn stream_video(
     let reader = BufReader::new(file);
     let mut video_reader = H26xSampleReader::new(reader, 1_048_576, false);
 
-    let ssrc = *track.ssrcs().await.first().ok_or("track without ssrc")?;
+    let ssrc = *track.ssrcs().await.first().ok_or("track has no SSRC")?;
 
     let mut ticker = interval(H26X_FRAME_DURATION);
     loop {
@@ -566,7 +566,7 @@ mod tests {
         assert!(
             result
                 .unwrap_err()
-                .contains("Error to create WebSocket request")
+                .contains("Failed to create WebSocket request")
         );
     }
 
@@ -625,7 +625,7 @@ mod tests {
         let client = Client::new();
         let result = create_room(&client, &url).await;
 
-        assert_eq!(result.unwrap_err(), "full rooms, try again later");
+        assert_eq!(result.unwrap_err(), "all rooms are full, try again later");
     }
 
     #[tokio::test]
@@ -637,7 +637,7 @@ mod tests {
 
         assert_eq!(
             result.unwrap_err(),
-            "Error: cases do not defined: 404 Not Found"
+            "Error: unexpected status: 404 Not Found"
         );
     }
 
@@ -656,14 +656,14 @@ mod tests {
     #[tokio::test]
     async fn test_create_room_connection_failure() {
         let client = Client::new();
-        // Conexão em porta que não está ouvindo
+        // Connect to a port that nothing is listening on
         let result = create_room(&client, "http://127.0.0.1:1/rooms").await;
 
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
-                .starts_with("Server is not working. Error = ")
+                .starts_with("Server is not responding. Error: ")
         );
     }
 
@@ -678,7 +678,7 @@ mod tests {
     fn test_apply_server_message_viewer_joined() {
         let mut panel = new_test_panel();
 
-        // 1. Inserir o primeiro viewer
+        // 1. Insert the first viewer
         apply_server_message(
             &mut panel,
             ServerToHost::ViewerJoined {
@@ -688,7 +688,7 @@ mod tests {
         assert_eq!(panel.viewers.len(), 1);
         assert!(panel.viewers.contains(&ViewerId(1)));
 
-        // 2. Inserir um segundo viewer diferente
+        // 2. Insert a second, different viewer
         apply_server_message(
             &mut panel,
             ServerToHost::ViewerJoined {
@@ -699,7 +699,7 @@ mod tests {
         assert!(panel.viewers.contains(&ViewerId(1)));
         assert!(panel.viewers.contains(&ViewerId(2)));
 
-        // 3. Inserir novamente um viewer já existente (comportamento de conjunto)
+        // 3. Insert an existing viewer again (set behavior)
         apply_server_message(
             &mut panel,
             ServerToHost::ViewerJoined {
@@ -715,7 +715,7 @@ mod tests {
         panel.viewers.insert(ViewerId(1));
         panel.viewers.insert(ViewerId(2));
 
-        // 1. Remover um viewer existente
+        // 1. Remove an existing viewer
         apply_server_message(
             &mut panel,
             ServerToHost::ViewerLeft {
@@ -726,7 +726,7 @@ mod tests {
         assert!(!panel.viewers.contains(&ViewerId(1)));
         assert!(panel.viewers.contains(&ViewerId(2)));
 
-        // 2. Remover um viewer que não estava presente (não deve causar pânico)
+        // 2. Remove a viewer that was not there (must not panic)
         apply_server_message(
             &mut panel,
             ServerToHost::ViewerLeft {
@@ -740,9 +740,9 @@ mod tests {
     #[test]
     fn test_apply_server_message_viewer_list() {
         let mut panel = new_test_panel();
-        panel.viewers.insert(ViewerId(99)); // viewer anterior
+        panel.viewers.insert(ViewerId(99)); // previous viewer
 
-        // 1. ViewerList substitui completamente os viewers anteriores
+        // 1. ViewerList fully replaces the previous viewers
         apply_server_message(
             &mut panel,
             ServerToHost::ViewerList {
@@ -754,7 +754,7 @@ mod tests {
             .collect();
         assert_eq!(panel.viewers, expected);
 
-        // 2. ViewerList vazia zera os viewers do painel
+        // 2. An empty ViewerList clears the panel viewers
         apply_server_message(&mut panel, ServerToHost::ViewerList { viewers: vec![] });
         assert!(panel.viewers.is_empty());
     }
@@ -764,7 +764,7 @@ mod tests {
         let mut panel = new_test_panel();
         panel.viewers.insert(ViewerId(1));
 
-        // SignalFromViewer não deve alterar os viewers do painel
+        // SignalFromViewer must not change the panel viewers
         apply_server_message(
             &mut panel,
             ServerToHost::SignalFromViewer {

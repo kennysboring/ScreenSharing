@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Viewer de Vídeo</title>
+  <title>Video Viewer</title>
   <style>
     * {
       box-sizing: border-box;
@@ -94,7 +94,7 @@
       align-items: center;
       justify-content: center;
       gap: 8px;
-      min-height: 44px; /* Otimizado para toque em celular */
+      min-height: 44px; /* Sized for touch on phones */
       touch-action: manipulation;
       transition: background-color 0.15s ease, border-color 0.15s ease;
       -webkit-tap-highlight-color: transparent;
@@ -128,22 +128,22 @@
     <video id="remoteVideo" autoplay muted playsinline></video>
     <div class="status-badge">
       <span class="status-dot" id="statusDot"></span>
-      <span id="statusText">conectando...</span>
+      <span id="statusText">connecting...</span>
     </div>
   </div>
 
   <div class="controls">
-    <button id="unmuteBtn" type="button">Ativar Som</button>
-    <button id="fullscreenBtn" type="button">Tela Cheia</button>
+    <button id="unmuteBtn" type="button">Unmute</button>
+    <button id="fullscreenBtn" type="button">Fullscreen</button>
   </div>
 
   <script>
-    // Configurações WebRTC (adicione servidores TURN aqui no futuro)
+    // WebRTC settings (add TURN servers here in the future)
     const ICE_SERVERS = [
       { urls: 'stun:stun.l.google.com:19302' }
     ];
 
-    // Elementos da UI
+    // UI elements
     const video = document.getElementById('remoteVideo');
     const videoContainer = document.getElementById('videoContainer');
     const statusText = document.getElementById('statusText');
@@ -151,7 +151,7 @@
     const unmuteBtn = document.getElementById('unmuteBtn');
     const fullscreenBtn = document.getElementById('fullscreenBtn');
 
-    // Estado da conexão
+    // Connection state
     let ws = null;
     let pc = null;
     let remoteStream = null;
@@ -161,7 +161,7 @@
     let reconnectTimeout = null;
     let hasConnectedOnce = false;
 
-    // Extrai o room_id do último segmento do pathname
+    // Take the room_id from the last segment of the pathname
     const pathSegments = window.location.pathname.replace(/\/+$/, '').split('/');
     const roomId = pathSegments[pathSegments.length - 1] || '';
 
@@ -200,12 +200,12 @@
       try {
         pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
       } catch (err) {
-        updateStatus('erro ao criar peer connection', 'error');
+        updateStatus('failed to create peer connection', 'error');
         return null;
       }
 
       pc.onicecandidate = (event) => {
-        // Se event.candidate for null ou candidate for string vazia (fim da coleta em alguns browsers), NÃO envia nada
+        // If event.candidate is null or candidate is an empty string (end of gathering in some browsers), send NOTHING
         if (event.candidate && event.candidate.candidate && event.candidate.candidate.trim() !== '' && ws && ws.readyState === WebSocket.OPEN) {
           const candidateJson = event.candidate.toJSON();
           const message = {
@@ -220,7 +220,7 @@
       };
 
       pc.ontrack = (event) => {
-        // Não depende de event.streams[0] (evita problemas caso o host não envie msid no SDP)
+        // Do not rely on event.streams[0] (avoids issues if the host does not send msid in the SDP)
         if (!remoteStream) {
           remoteStream = new MediaStream();
           video.srcObject = remoteStream;
@@ -228,15 +228,15 @@
         if (event.track) {
           remoteStream.addTrack(event.track);
         }
-        updateStatus('ao vivo', 'live');
+        updateStatus('live', 'live');
 
-        // Tenta minimizar a latência ajustando o jitterBufferTarget do receiver se suportado
-        // (Nota: jitterBufferTarget = 0 pede latência mínima; em rede instável pode-se usar de 50 a 100ms)
+        // Try to minimize latency by setting the receiver's jitterBufferTarget, if supported
+        // (Note: jitterBufferTarget = 0 asks for minimum latency; on an unstable network 50 to 100 ms can be used)
         if (event.receiver && 'jitterBufferTarget' in event.receiver) {
           try {
             event.receiver.jitterBufferTarget = 0;
           } catch (e) {
-            // Ignora se não for suportado pelo navegador
+            // Ignore if the browser does not support it
           }
         }
       };
@@ -245,13 +245,13 @@
         if (!pc) return;
         const state = pc.connectionState;
         if (state === 'connected') {
-          updateStatus('ao vivo', 'live');
+          updateStatus('live', 'live');
         } else if (state === 'connecting') {
-          updateStatus('conectando...', 'connecting');
+          updateStatus('connecting...', 'connecting');
         } else if (state === 'failed') {
-          updateStatus('conexão falhou', 'error');
+          updateStatus('connection failed', 'error');
         } else if (state === 'disconnected') {
-          updateStatus('desconectado', 'error');
+          updateStatus('disconnected', 'error');
         }
       };
 
@@ -267,17 +267,17 @@
           type: 'offer',
           sdp: offerSdp
         }));
-        if (peer !== pc) return; // Checagem contra corrida de offers
+        if (peer !== pc) return; // Guard against racing offers
         isRemoteDescriptionSet = true;
 
-        // Esvazia e aplica os ICE candidates enfileirados
+        // Drain and apply the queued ICE candidates
         while (iceCandidateQueue.length > 0) {
           if (peer !== pc) return;
           const candidate = iceCandidateQueue.shift();
           try {
             await peer.addIceCandidate(candidate);
           } catch (e) {
-            // Ignora falha de candidato específico para não quebrar a conexão
+            // Ignore a single candidate failure so the connection does not break
           }
         }
 
@@ -299,7 +299,7 @@
         }
       } catch (err) {
         if (peer === pc) {
-          updateStatus('erro no WebRTC', 'error');
+          updateStatus('WebRTC error', 'error');
         }
       }
     }
@@ -320,14 +320,14 @@
         try {
           await pc.addIceCandidate(iceInit);
         } catch (err) {
-          // Ignora falha em candidato individual
+          // Ignore a failure on an individual candidate
         }
       }
     }
 
     function connectWebSocket() {
       if (!roomId) {
-        updateStatus('sala indisponível', 'error');
+        updateStatus('room unavailable', 'error');
         return;
       }
 
@@ -348,8 +348,8 @@
 
       ws.onopen = () => {
         hasConnectedOnce = true;
-        reconnectDelay = 1000; // Zera a espera ao conectar com sucesso
-        updateStatus('aguardando o host...', 'connecting');
+        reconnectDelay = 1000; // Reset the wait after a successful connection
+        updateStatus('waiting for the host...', 'connecting');
       };
 
       ws.onmessage = (event) => {
@@ -357,7 +357,7 @@
         try {
           data = JSON.parse(event.data);
         } catch (err) {
-          // Ignora JSON inválido sem quebrar a página
+          // Ignore invalid JSON without breaking the page
           return;
         }
 
@@ -369,7 +369,7 @@
           case 'hostUnavailable':
             closePeerConnection();
             resetVideo();
-            updateStatus('aguardando o host...', 'connecting');
+            updateStatus('waiting for the host...', 'connecting');
             break;
 
           case 'signalFromHost':
@@ -384,15 +384,15 @@
             break;
 
           default:
-            // Tipo desconhecido: ignora silenciosamente
+            // Unknown type: ignore silently
             break;
         }
       };
 
       ws.onerror = () => {
-        // WebSocket do navegador não expõe status HTTP. Se nunca conectou, indica sala indisponível
+        // The browser WebSocket does not expose the HTTP status. If it never connected, show room unavailable
         if (!hasConnectedOnce) {
-          updateStatus('sala indisponível', 'error');
+          updateStatus('room unavailable', 'error');
         }
       };
 
@@ -400,9 +400,9 @@
         closePeerConnection();
         resetVideo();
         if (!hasConnectedOnce) {
-          updateStatus('sala indisponível', 'error');
+          updateStatus('room unavailable', 'error');
         } else {
-          updateStatus('conectando...', 'connecting');
+          updateStatus('connecting...', 'connecting');
         }
         scheduleReconnect();
       };
@@ -415,23 +415,23 @@
         connectWebSocket();
       }, reconnectDelay);
 
-      // Espera crescente: 1s, 2s, 4s, 8s, 15s (teto em 15s)
+      // Growing wait: 1s, 2s, 4s, 8s, 15s (capped at 15s)
       reconnectDelay = Math.min(reconnectDelay * 2, 15000);
     }
 
-    // Botão de Áudio (Tirar mudo / Mudo)
+    // Audio button (unmute / mute)
     unmuteBtn.addEventListener('click', () => {
       if (video.muted) {
         video.muted = false;
         video.play().catch(() => {});
-        unmuteBtn.textContent = 'Silenciar';
+        unmuteBtn.textContent = 'Mute';
       } else {
         video.muted = true;
-        unmuteBtn.textContent = 'Ativar Som';
+        unmuteBtn.textContent = 'Unmute';
       }
     });
 
-    // Botão de Tela Cheia
+    // Fullscreen button
     fullscreenBtn.addEventListener('click', () => {
       const target = videoContainer;
       if (!document.fullscreenElement && !document.webkitFullscreenElement) {
@@ -440,7 +440,7 @@
         } else if (target.webkitRequestFullscreen) {
           target.webkitRequestFullscreen();
         } else if (video.webkitEnterFullscreen) {
-          // Suporte para iOS Safari direto no elemento video
+          // iOS Safari support, directly on the video element
           video.webkitEnterFullscreen();
         }
       } else {
@@ -452,8 +452,8 @@
       }
     });
 
-    // Inicia a conexão
-    updateStatus('conectando...', 'connecting');
+    // Start the connection
+    updateStatus('connecting...', 'connecting');
     connectWebSocket();
   </script>
 </body>

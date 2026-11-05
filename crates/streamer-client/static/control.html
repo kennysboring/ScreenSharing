@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Painel de Controle - Streamer</title>
+  <title>Control Panel - Streamer</title>
   <style>
     * {
       box-sizing: border-box;
@@ -165,26 +165,26 @@
 <body>
 
   <main class="card">
-    <h1>Painel de Controle</h1>
+    <h1>Control Panel</h1>
 
     <div class="status-container">
       <span class="status-dot" id="statusDot"></span>
-      <span class="status-text" id="statusText" aria-live="polite">conectando...</span>
+      <span class="status-text" id="statusText" aria-live="polite">connecting...</span>
     </div>
 
-    <!-- Seção: Live -->
+    <!-- Section: live -->
     <div class="section" id="liveSection">
-      <div class="viewers-badge" id="viewersText">0 viewers conectados</div>
+      <div class="viewers-badge" id="viewersText">0 viewers connected</div>
       <div class="link-group">
-        <label for="viewerLinkInput">Link do Viewer</label>
+        <label for="viewerLinkInput">Viewer link</label>
         <div class="input-row">
           <input type="text" id="viewerLinkInput" readonly spellcheck="false" autocomplete="off">
-          <button type="button" id="copyBtn">Copiar link</button>
+          <button type="button" id="copyBtn">Copy link</button>
         </div>
       </div>
     </div>
 
-    <!-- Seção: Erro em destaque -->
+    <!-- Section: highlighted error -->
     <div class="section" id="errorSection">
       <div class="error-box" id="errorMessageText"></div>
     </div>
@@ -202,7 +202,7 @@
 
     let copyResetTimer = null;
 
-    // Um toque no campo seleciona todo o texto
+    // A tap on the field selects all the text
     viewerLinkInput.addEventListener('click', () => {
       viewerLinkInput.select();
     });
@@ -210,16 +210,16 @@
       viewerLinkInput.select();
     });
 
-    // Copiar link com navigator.clipboard e fallback
+    // Copy the link with navigator.clipboard, with a fallback
     copyBtn.addEventListener('click', () => {
       const text = viewerLinkInput.value;
       if (!text) return;
 
       const setCopiedLabel = () => {
-        copyBtn.textContent = 'Copiado!';
+        copyBtn.textContent = 'Copied!';
         if (copyResetTimer) clearTimeout(copyResetTimer);
         copyResetTimer = setTimeout(() => {
-          copyBtn.textContent = 'Copiar link';
+          copyBtn.textContent = 'Copy link';
           copyResetTimer = null;
         }, 2000);
       };
@@ -241,7 +241,7 @@
           callback();
         }
       } catch (err) {
-        // Falha silenciosa se não suportado
+        // Fail silently if not supported
       }
     }
 
@@ -278,14 +278,14 @@
     }
 
     function showDisconnected() {
-      setStatus('programa desconectado', 'error');
+      setStatus('program disconnected', 'error');
       liveSection.classList.remove('visible');
       errorSection.classList.remove('visible');
     }
 
     function handleState(data) {
       if (!data || typeof data.state !== 'string') {
-        setStatus('estado desconhecido', null);
+        setStatus('unknown state', null);
         liveSection.classList.remove('visible');
         errorSection.classList.remove('visible');
         return;
@@ -293,21 +293,21 @@
 
       switch (data.state) {
         case 'creating':
-          setStatus('criando a sala...', 'creating');
+          setStatus('creating the room...', 'creating');
           liveSection.classList.remove('visible');
           errorSection.classList.remove('visible');
           break;
 
         case 'live':
-          setStatus('ao vivo', 'live');
+          setStatus('live', 'live');
           errorSection.classList.remove('visible');
           liveSection.classList.add('visible');
 
           const count = typeof data.viewers === 'number' ? data.viewers : 0;
           if (count === 1) {
-            viewersText.textContent = '1 viewer conectado';
+            viewersText.textContent = '1 viewer connected';
           } else {
-            viewersText.textContent = count + ' viewers conectados';
+            viewersText.textContent = count + ' viewers connected';
           }
 
           if (typeof data.viewerLink === 'string') {
@@ -316,21 +316,21 @@
           break;
 
         case 'error':
-          setStatus('erro', 'error');
+          setStatus('error', 'error');
           liveSection.classList.remove('visible');
-          errorMessageText.textContent = typeof data.message === 'string' ? data.message : 'Ocorreu um erro inesperado.';
+          errorMessageText.textContent = typeof data.message === 'string' ? data.message : 'An unexpected error occurred.';
           errorSection.classList.add('visible');
           break;
 
         default:
-          setStatus('estado desconhecido', null);
+          setStatus('unknown state', null);
           liveSection.classList.remove('visible');
           errorSection.classList.remove('visible');
           break;
       }
     }
 
-    // Inicia o ciclo de polling
+    // Start the polling loop
     pollStatus();
   </script>
 </body>
