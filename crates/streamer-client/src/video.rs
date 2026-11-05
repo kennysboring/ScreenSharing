@@ -82,6 +82,12 @@ async fn stream_video(
     Ok(())
 }
 
+/// Returns the H.264 NAL unit type (the low 5 bits of the first byte), or `None` if `data` is
+/// empty.
+fn nal_type(data: &[u8]) -> Option<u8> {
+    data.first().map(|byte| byte & 0x1f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +123,17 @@ mod tests {
         assert!(result.is_ok());
 
         let _ = session.pc.close().await;
+    }
+
+    #[test]
+    fn test_nal_type() {
+        // First bytes of real samples from test-assets/test.h264
+        assert_eq!(nal_type(&[0x67, 0x42, 0xc0, 0x1f, 0xd9, 0x00]), Some(7)); // SPS
+        assert_eq!(nal_type(&[0x68, 0xcb, 0x83, 0xcb, 0x20]), Some(8)); // PPS
+        assert_eq!(nal_type(&[0x65, 0x88, 0x84, 0x0b, 0xf2, 0x62]), Some(5)); // IDR
+        assert_eq!(nal_type(&[0x41, 0x9a, 0x38, 0x17, 0xe0, 0x61]), Some(1)); // P-frame
+        assert_eq!(nal_type(&[0x25]), Some(5)); // IDR with a different nal_ref_idc
+        assert_eq!(nal_type(&[0x06]), Some(6)); // SEI
+        assert_eq!(nal_type(&[]), None);
     }
 }
