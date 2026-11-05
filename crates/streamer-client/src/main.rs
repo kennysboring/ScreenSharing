@@ -778,4 +778,128 @@ mod tests {
         assert_eq!(panel.viewers.len(), 1);
         assert!(panel.viewers.contains(&ViewerId(1)));
     }
+
+    fn shared_panel(phase: Phase, viewers: &[ViewerId]) -> SharedPanel {
+        Arc::new(Mutex::new(Panel {
+            phase,
+            viewers: viewers.iter().copied().collect(),
+        }))
+    }
+
+    async fn status_json(panel: SharedPanel) -> serde_json::Value {
+        let Json(status) = panel_status(State(panel)).await;
+        serde_json::to_value(status).expect("status should serialize")
+    }
+
+    #[tokio::test]
+    async fn test_panel_status_creating() {
+        let panel = shared_panel(Phase::Creating, &[ViewerId(1)]);
+
+        assert_eq!(
+            status_json(panel).await,
+            serde_json::json!({ "state": "creating" })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_panel_status_live_counts_viewers() {
+        let panel = shared_panel(
+            Phase::Live {
+                viewer_link: "http://127.0.0.1:3000/room/abc".to_string(),
+            },
+            &[ViewerId(1), ViewerId(2)],
+        );
+
+        assert_eq!(
+            status_json(panel).await,
+            serde_json::json!({
+                "state": "live",
+                "viewerLink": "http://127.0.0.1:3000/room/abc",
+                "viewers": 2
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_panel_status_error() {
+        let panel = shared_panel(
+            Phase::Error {
+                message: "boom".to_string(),
+            },
+            &[],
+        );
+
+        assert_eq!(
+            status_json(panel).await,
+            serde_json::json!({ "state": "error", "message": "boom" })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_make_offer_negotiates_h264_video() {
+        let (sdp, session) = make_offer().await.expect("should create offer");
+
+        assert!(sdp.contains("m=video"));
+        assert!(sdp.contains("H264/90000"));
+        assert!(sdp.contains("profile-level-id=42e01f"));
+        assert!(sdp.contains("packetization-mode=1"));
+        assert!(!session.answered);
+        assert!(session.pending.is_empty());
+
+        let _ = session.pc.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_make_offer_track_has_ssrc() {
+        let (_sdp, session) = make_offer().await.expect("should create offer");
+
+        let ssrcs = session.track.ssrcs().await;
+        assert_eq!(ssrcs.len(), 1);
+
+        let _ = session.pc.close().await;
+    }
+
+    fn temp_file_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "streamer-client-{}-{}-{name}",
+            std::process::id(),
+            rand::random::<u32>()
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_stream_video_missing_file_fails() {
+        let (_sdp, session) = make_offer().await.expect("should create offer");
+        let path = temp_file_path("missing.h264");
+
+        let result = stream_video(path.to_str().unwrap(), session.track.clone(), 102).await;
+        assert!(result.is_err());
+
+        let _ = session.pc.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_stream_video_empty_file_ends_ok() {
+        let (_sdp, session) = make_offer().await.expect("should create offer");
+        let path = temp_file_path("empty.h264");
+        std::fs::write(&path, []).expect("should create empty file");
+
+        let result = stream_video(path.to_str().unwrap(), session.track.clone(), 102).await;
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok());
+
+        let _ = session.pc.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_negotiated_payload_type_uses_registered_h264() {
+        let (_sdp, session) = make_offer().await.expect("should create offer");
+
+        let payload_type = negotiated_payload_type(&session.sender)
+            .await
+            .expect("sender should have a codec");
+        assert_eq!(payload_type, 102);
+
+        let _ = session.pc.close().await;
+    }
 }
