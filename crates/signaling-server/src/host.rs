@@ -1,6 +1,8 @@
 //! Host WebSocket: checks the host token, then relays signaling between the host and the viewers.
 
-use crate::rooms::{MAX_MESSAGE_SIZE, SharedState, register_host, remove_viewer, unregister_host};
+use crate::rooms::{
+    MAX_MESSAGE_SIZE, SharedState, is_current_host, register_host, remove_viewer, unregister_host,
+};
 use axum::{
     extract::{
         Path, State, WebSocketUpgrade,
@@ -110,7 +112,7 @@ fn handle_host_message(msg: &str, state: &SharedState, room_id: &str, id_host: U
             return true;
         };
 
-        if !matches!(&room.host, Some(h) if h.id == id_host) {
+        if !is_current_host(room, id_host) {
             return false;
         }
 

@@ -87,8 +87,16 @@ pub fn register_host(room: &mut Room) -> (Receiver<ServerToHost>, Uuid) {
     (receiver, id)
 }
 
+/// Whether `id` is the host currently registered in the room. A host connection that was
+/// replaced by a newer one is no longer the current host.
+pub fn is_current_host(room: &Room, id: Uuid) -> bool {
+    matches!(&room.host, Some(host) if host.id == id)
+}
+
+/// Marks the room as having no host, but only if `id_host` is still the current host, so an
+/// old connection that ends does not remove the host that replaced it.
 pub fn unregister_host(room: &mut Room, id_host: Uuid, now: Instant) {
-    if matches!(&room.host, Some(host) if host.id == id_host) {
+    if !is_current_host(room, id_host) {
         return;
     }
 
@@ -255,7 +263,7 @@ mod tests {
 
         let (_rx, id) = register_host(&mut room);
 
-        assert!(matches!(&room.host, Some(h) if h.id == id));
+        assert!(is_current_host(&room, id));
         assert_eq!(room.host_absent_since, None);
     }
 
@@ -269,7 +277,7 @@ mod tests {
         let (_rx2, id2) = register_host(&mut room);
 
         assert_ne!(id1, id2);
-        assert!(matches!(&room.host, Some(h) if h.id == id2));
+        assert!(is_current_host(&room, id2));
 
         // The first receiver still delivers the message that was queued
         let msg = rx1
@@ -279,5 +287,78 @@ mod tests {
 
         // Only then does it return TryRecvError::Disconnected, because the old sender was dropped
         assert_eq!(rx1.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn test_is_current_host() {
+        let mut room = room_with(None);
+        assert!(!is_current_host(&room, Uuid::new_v4()));
+
+        let (_rx1, id1) = register_host(&mut room);
+        assert!(is_current_host(&room, id1));
+        assert!(!is_current_host(&room, Uuid::new_v4()));
+
+        // After a replacement, only the newest connection is the current host
+        let (_rx2, id2) = register_host(&mut room);
+        assert!(!is_current_host(&room, id1));
+        assert!(is_current_host(&room, id2));
+    }
+
+    #[test]
+    fn test_unregister_host_current_host_leaves() {
+        let mut room = room_with(None);
+        let (viewer_tx, mut viewer_rx) = channel(4);
+        room.viewers.insert(ViewerId(0), viewer_tx);
+        let (_rx, id) = register_host(&mut room);
+
+        let now = Instant::now();
+        unregister_host(&mut room, id, now);
+
+        assert!(room.host.is_none(), "the host that left must be removed");
+        assert_eq!(room.host_absent_since, Some(now));
+        assert_eq!(viewer_rx.try_recv(), Ok(ServerToViewer::HostUnavailable));
+    }
+
+    #[test]
+    fn test_unregister_host_old_connection_keeps_new_host() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let mut room = room_with(None);
+        let (viewer_tx, mut viewer_rx) = channel(4);
+        room.viewers.insert(ViewerId(0), viewer_tx);
+        let (_rx1, id1) = register_host(&mut room);
+        let (mut rx2, id2) = register_host(&mut room);
+
+        // The replaced connection ends after the new host registered
+        unregister_host(&mut room, id1, Instant::now());
+
+        assert!(is_current_host(&room, id2), "the new host must stay");
+        assert_eq!(room.host_absent_since, None);
+        assert!(
+            viewer_rx.try_recv().is_err(),
+            "viewers must not be told the host left"
+        );
+
+        // The new host channel is still open: its queued ViewerList, then Empty (not Disconnected)
+        assert!(matches!(
+            rx2.try_recv(),
+            Ok(ServerToHost::ViewerList { .. })
+        ));
+        assert_eq!(rx2.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn test_unregister_host_lets_room_expire() {
+        let mut rooms = HashMap::new();
+        let mut room = room_with(None);
+        let (_rx, id) = register_host(&mut room);
+
+        let left_at = Instant::now();
+        unregister_host(&mut room, id, left_at);
+        rooms.insert("room1".to_string(), room);
+
+        // Once the host left, the room expires after the grace period
+        remove_expired_rooms(&mut rooms, left_at + HOST_ABSENCE_GRACE, HOST_ABSENCE_GRACE);
+        assert!(rooms.is_empty());
     }
 }
