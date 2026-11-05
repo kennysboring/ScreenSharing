@@ -1,0 +1,110 @@
+//! Sends a pre-encoded H.264 file through a video track, one frame every 33 ms.
+
+use rtc::{
+    media::{Sample, io::h26x_reader::H26xSampleReader},
+    rtp_transceiver::PayloadType,
+};
+use std::{
+    fs::File,
+    io::BufReader,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::time::interval;
+use webrtc::media_stream::{Track, track_local::static_sample::TrackLocalStaticSample};
+
+const TEST_VIDEO_PATH: &str = "test-assets/test.h264";
+const H26X_FRAME_DURATION: Duration = Duration::from_millis(33);
+
+/// Starts sending the test video in the background, 2 seconds from now.
+pub fn start_test_video(track: Arc<TrackLocalStaticSample>, payload_type: PayloadType) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if stream_video(TEST_VIDEO_PATH, track, payload_type)
+            .await
+            .is_err()
+        {
+            println!("Error streaming video");
+        }
+    });
+}
+
+async fn stream_video(
+    path: &str,
+    track: Arc<TrackLocalStaticSample>,
+    payload_type: PayloadType,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut video_reader = H26xSampleReader::new(reader, 1_048_576, false);
+
+    let ssrc = *track.ssrcs().await.first().ok_or("track has no SSRC")?;
+
+    let mut ticker = interval(H26X_FRAME_DURATION);
+    loop {
+        let sample = match video_reader.next_sample() {
+            Ok(sample) => sample,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                break;
+            }
+        };
+
+        track
+            .sample_writer(ssrc, payload_type)
+            .write_sample(&Sample {
+                data: sample.data,
+                duration: if sample.timed {
+                    H26X_FRAME_DURATION
+                } else {
+                    Duration::ZERO
+                },
+                ..Sample::new(Instant::now())
+            })
+            .await?;
+
+        if sample.timed {
+            let _ = ticker.tick().await;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer::make_offer;
+
+    fn temp_file_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "streamer-client-{}-{}-{name}",
+            std::process::id(),
+            rand::random::<u32>()
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_stream_video_missing_file_fails() {
+        let (_sdp, session) = make_offer().await.expect("should create offer");
+        let path = temp_file_path("missing.h264");
+
+        let result = stream_video(path.to_str().unwrap(), session.track.clone(), 102).await;
+        assert!(result.is_err());
+
+        let _ = session.pc.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_stream_video_empty_file_ends_ok() {
+        let (_sdp, session) = make_offer().await.expect("should create offer");
+        let path = temp_file_path("empty.h264");
+        std::fs::write(&path, []).expect("should create empty file");
+
+        let result = stream_video(path.to_str().unwrap(), session.track.clone(), 102).await;
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok());
+
+        let _ = session.pc.close().await;
+    }
+}

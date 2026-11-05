@@ -1,94 +1,25 @@
-use axum::{Json, Router, extract::State, response::Html, routing::get};
-use common::{CreateRoomResponse, HostToServer, ServerToHost, SignalMessage, ViewerId};
+mod panel;
+mod peer;
+mod signaling;
+mod video;
+
+use common::{HostToServer, ServerToHost, SignalMessage, ViewerId};
 use futures_util::{SinkExt, StreamExt};
-use reqwest::{
-    Client, StatusCode,
-    header::{AUTHORIZATION, HeaderValue},
-};
-use rtc::{
-    interceptor::Registry,
-    media::{Sample, io::h26x_reader::H26xSampleReader},
-    media_stream::MediaStreamTrack,
-    peer_connection::configuration::media_engine::MIME_TYPE_H264,
-    rtp_transceiver::{
-        PayloadType,
-        rtp_sender::{
-            RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
-            RtpCodecKind,
-        },
-    },
-};
-use serde::Serialize;
+use panel::{Panel, Phase, SharedPanel, apply_server_message, run_panel};
+use peer::{Session, make_offer};
+use reqwest::Client;
+use signaling::{build_ws_request, create_room, validate_addr};
 use std::{
     collections::{HashMap, HashSet},
     env::args,
-    fs::File,
-    io::BufReader,
     process::ExitCode,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
-use tokio::time::interval;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Error::Http, Message, client::IntoClientRequest, handshake::client::Request},
+    tungstenite::{Error::Http, Message},
 };
-use webrtc::{
-    media_stream::{
-        Track,
-        track_local::{TrackLocal, static_sample::TrackLocalStaticSample},
-    },
-    peer_connection::{
-        MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-        RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer, RTCPeerConnectionIceEvent,
-        RTCPeerConnectionState, RTCSessionDescription, register_default_interceptors,
-    },
-    rtp_transceiver::RtpSender,
-};
-
-#[derive(Clone)]
-struct Handler;
-
-#[async_trait::async_trait]
-impl PeerConnectionEventHandler for Handler {
-    async fn on_ice_candidate(&self, _event: RTCPeerConnectionIceEvent) {}
-    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        println!("connection state: {state}");
-    }
-}
-
-struct Session {
-    pc: Arc<dyn PeerConnection>,
-    track: Arc<TrackLocalStaticSample>,
-    sender: Arc<dyn RtpSender>,
-    answered: bool,
-    pending: Vec<RTCIceCandidateInit>,
-}
-
-#[derive(Serialize)]
-#[serde(
-    tag = "state",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-enum PanelStatus {
-    Creating,
-    Live { viewer_link: String, viewers: usize },
-    Error { message: String },
-}
-
-enum Phase {
-    Creating,
-    Live { viewer_link: String },
-    Error { message: String },
-}
-
-struct Panel {
-    phase: Phase,
-    viewers: HashSet<ViewerId>,
-}
-
-type SharedPanel = Arc<Mutex<Panel>>;
+use webrtc::peer_connection::RTCIceCandidateInit;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -154,123 +85,49 @@ async fn main() -> ExitCode {
 
     let mut sessions: HashMap<ViewerId, Session> = HashMap::new();
     while let Some(message) = split_stream.next().await {
-        match message {
-            Ok(Message::Text(text)) => {
-                let Ok(msg) = serde_json::from_str::<ServerToHost>(&text) else {
-                    continue;
-                };
-
-                if let ServerToHost::SignalFromViewer {
-                    from,
-                    message: SignalMessage::Answer { sdp },
-                } = &msg
-                    && let Some(session) = sessions.get_mut(from)
-                {
-                    let Ok(desc) = RTCSessionDescription::answer(sdp.clone()) else {
-                        continue;
-                    };
-                    match session.pc.set_remote_description(desc).await {
-                        Ok(_) => {
-                            println!("answer applied");
-                            session.answered = true;
-
-                            if let Ok(payload_type) = negotiated_payload_type(&session.sender).await
-                            {
-                                let track = session.track.clone(); // a copy, because the task outlives this block
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                    if stream_video("test-assets/test.h264", track, payload_type)
-                                        .await
-                                        .is_err()
-                                    {
-                                        println!("Error streaming video");
-                                    }
-                                });
-                            } else {
-                                println!("no codec negotiated");
-                            }
-
-                            for candidate in std::mem::take(&mut session.pending) {
-                                let _ = session.pc.add_ice_candidate(candidate).await;
-                            }
-                        }
-                        Err(e) => println!("failed to apply the answer: {e}"),
-                    }
-                }
-
-                if let ServerToHost::SignalFromViewer {
-                    from,
-                    message:
-                        SignalMessage::Ice {
-                            candidate,
-                            sdp_mid,
-                            sdp_mline_index,
-                            username_fragment,
-                        },
-                } = &msg
-                    && let Some(session) = sessions.get_mut(from)
-                {
-                    let init = RTCIceCandidateInit {
-                        candidate: candidate.clone(),
-                        sdp_mid: sdp_mid.clone(),
-                        sdp_mline_index: *sdp_mline_index,
-                        username_fragment: username_fragment.clone(),
-                        ..Default::default()
-                    };
-                    // if session.answered: add_ice_candidate(init).await, else session.pending.push(init)
-                    if session.answered {
-                        let _ = session.pc.add_ice_candidate(init).await;
-                    } else {
-                        session.pending.push(init)
-                    }
-                }
-
-                let joined = match &msg {
-                    ServerToHost::ViewerJoined { viewer_id } => Some(*viewer_id),
-                    _ => None,
-                };
-
-                if let ServerToHost::ViewerLeft { viewer_id } = &msg {
-                    if let Some(session) = sessions.remove(viewer_id) {
-                        let _ = session.pc.close().await;
-                    }
-                    println!("active sessions: {}", sessions.len());
-                }
-
-                {
-                    //.lock in
-                    let mut guard = panel.lock().unwrap();
-                    apply_server_message(&mut guard, msg);
-                } //.lock out
-
-                if let Some(viewer_id) = joined {
-                    let (sdp, session) = match make_offer().await {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            eprintln!("Error: {e}");
-                            continue;
-                        }
-                    };
-
-                    sessions.insert(viewer_id, session);
-                    println!("active sessions: {}", sessions.len());
-
-                    let reply = HostToServer::SignalToViewer {
-                        to: viewer_id,
-                        message: SignalMessage::Offer { sdp },
-                    };
-                    let Ok(json) = serde_json::to_string(&reply) else {
-                        continue;
-                    };
-                    if split_sink.send(Message::Text(json.into())).await.is_err() {
-                        break;
-                    }
-                }
-            }
+        let text = match message {
+            Ok(Message::Text(text)) => text,
             Ok(Message::Close(_)) => break,
-            Ok(_) => {}
+            Ok(_) => continue,
             Err(e) => {
                 eprintln!("WebSocket message error: {e}");
+                break;
+            }
+        };
+
+        let Ok(msg) = serde_json::from_str::<ServerToHost>(&text) else {
+            continue;
+        };
+
+        handle_viewer_signal(&msg, &mut sessions).await;
+
+        let joined = match &msg {
+            ServerToHost::ViewerJoined { viewer_id } => Some(*viewer_id),
+            _ => None,
+        };
+
+        if let ServerToHost::ViewerLeft { viewer_id } = &msg {
+            if let Some(session) = sessions.remove(viewer_id) {
+                let _ = session.pc.close().await;
+            }
+            println!("active sessions: {}", sessions.len());
+        }
+
+        {
+            //.lock in
+            let mut guard = panel.lock().unwrap();
+            apply_server_message(&mut guard, msg);
+        } //.lock out
+
+        if let Some(viewer_id) = joined {
+            let Some(offer_json) = start_session(viewer_id, &mut sessions).await else {
+                continue;
+            };
+            if split_sink
+                .send(Message::Text(offer_json.into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -279,627 +136,55 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn run_panel(panel: SharedPanel) {
-    let app = Router::new()
-        .route("/api/status", get(panel_status))
-        .route("/", get(panel_page))
-        .with_state(panel);
-
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:8787").await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Error: could not bind the port: {e}");
-            return;
-        }
+/// Passes a viewer's answer or ICE candidate to that viewer's session.
+async fn handle_viewer_signal(msg: &ServerToHost, sessions: &mut HashMap<ViewerId, Session>) {
+    let ServerToHost::SignalFromViewer { from, message } = msg else {
+        return;
+    };
+    let Some(session) = sessions.get_mut(from) else {
+        return;
     };
 
-    if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("Error in axum::serve: {e}");
-    }
-}
-
-async fn panel_status(State(panel): State<SharedPanel>) -> Json<PanelStatus> {
-    let guard = panel.lock().unwrap();
-    match &guard.phase {
-        Phase::Creating => Json(PanelStatus::Creating),
-        Phase::Live { viewer_link } => Json(PanelStatus::Live {
-            viewer_link: viewer_link.clone(),
-            viewers: guard.viewers.len(),
-        }),
-        Phase::Error { message } => Json(PanelStatus::Error {
-            message: message.clone(),
-        }),
-    }
-}
-
-async fn panel_page() -> Html<&'static str> {
-    Html(include_str!("../static/control.html"))
-}
-
-fn validate_addr(addr: &str) -> Result<(), &'static str> {
-    if addr.contains("localhost") {
-        return Err("Use 127.0.0.1 instead of localhost");
-    }
-    Ok(())
-}
-
-fn build_ws_request(addr: &str, room: &CreateRoomResponse) -> Result<Request, String> {
-    let ws_url = format!("ws://{addr}/ws/host/{}", room.room_id);
-    let mut request = ws_url
-        .into_client_request()
-        .map_err(|e| format!("Failed to create WebSocket request: {e}"))?;
-
-    let authorization_value = HeaderValue::from_str(&format!("Bearer {}", room.host_token))
-        .map_err(|_| "Invalid Authorization: Bearer <token>".to_string())?;
-
-    request
-        .headers_mut()
-        .insert(AUTHORIZATION, authorization_value);
-
-    Ok(request)
-}
-
-async fn create_room(client: &Client, url: &str) -> Result<CreateRoomResponse, String> {
-    let response = match client.post(url).send().await {
-        Ok(response) => response,
-        Err(e) => return Err(format!("Server is not responding. Error: {e}")),
-    };
-
-    match response.status() {
-        StatusCode::OK => response
-            .json::<CreateRoomResponse>()
-            .await
-            .map_err(|e| format!("Error: {e}")),
-        StatusCode::SERVICE_UNAVAILABLE => Err("all rooms are full, try again later".to_string()),
-        other_status => Err(format!("Error: unexpected status: {other_status}")),
-    }
-}
-
-fn apply_server_message(panel: &mut Panel, msg: ServerToHost) {
-    match msg {
-        ServerToHost::ViewerJoined { viewer_id } => {
-            panel.viewers.insert(viewer_id);
-        }
-        ServerToHost::ViewerLeft { viewer_id } => {
-            panel.viewers.remove(&viewer_id);
-        }
-        ServerToHost::SignalFromViewer { .. } => {}
-        ServerToHost::ViewerList { viewers } => panel.viewers = viewers.into_iter().collect(),
-    }
-}
-
-async fn make_offer() -> Result<(String, Session), Box<dyn std::error::Error>> {
-    let config = RTCConfigurationBuilder::default()
-        .with_ice_servers(vec![RTCIceServer {
-            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-            ..Default::default()
-        }])
-        .build();
-
-    let video_codec = RTCRtpCodecParameters {
-        rtp_codec: RTCRtpCodec {
-            mime_type: MIME_TYPE_H264.to_owned(),
-            clock_rate: 90000,
-            channels: 0,
-            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                .to_owned(),
-            rtcp_feedback: vec![],
-        },
-        payload_type: 102,
-    };
-
-    let mut media_engine = MediaEngine::default();
-    media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
-    let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
-
-    let pc = PeerConnectionBuilder::new()
-        .with_configuration(config)
-        .with_handler(Arc::new(Handler))
-        .with_udp_addrs(vec!["0.0.0.0:0"])
-        .with_media_engine(media_engine)
-        .with_interceptor_registry(registry)
-        .build()
-        .await?;
-
-    let ssrc = rand::random::<u32>();
-    let track = Arc::new(TrackLocalStaticSample::new(
-        Instant::now(),
-        MediaStreamTrack::new(
-            "stream".to_string(),
-            "track".to_string(),
-            "label".to_string(),
-            RtpCodecKind::Video,
-            vec![RTCRtpEncodingParameters {
-                rtp_coding_parameters: RTCRtpCodingParameters {
-                    ssrc: Some(ssrc),
-                    ..Default::default()
-                },
-                codec: video_codec.rtp_codec.clone(),
+    match message {
+        SignalMessage::Answer { sdp } => session.apply_answer(sdp).await,
+        SignalMessage::Ice {
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+            username_fragment,
+        } => {
+            let init = RTCIceCandidateInit {
+                candidate: candidate.clone(),
+                sdp_mid: sdp_mid.clone(),
+                sdp_mline_index: *sdp_mline_index,
+                username_fragment: username_fragment.clone(),
                 ..Default::default()
-            }],
-        ),
-    )?);
+            };
+            session.add_remote_candidate(init).await;
+        }
+        SignalMessage::Offer { .. } => {}
+    }
+}
 
-    let pc: Arc<dyn PeerConnection> = Arc::new(pc);
-    let sender = pc
-        .add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
-        .await?;
-
-    let offer = pc.create_offer(None).await?;
-    let offer_sdp = offer.sdp.clone();
-    pc.set_local_description(offer).await?;
-
-    let session: Session = Session {
-        pc,
-        track,
-        sender,
-        answered: false,
-        pending: Vec::new(),
+/// Creates a session for a new viewer and returns the offer message to send to it.
+async fn start_session(
+    viewer_id: ViewerId,
+    sessions: &mut HashMap<ViewerId, Session>,
+) -> Option<String> {
+    let (sdp, session) = match make_offer().await {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return None;
+        }
     };
-    Ok((offer_sdp, session))
-}
 
-async fn negotiated_payload_type(
-    sender: &Arc<dyn RtpSender>,
-) -> Result<PayloadType, Box<dyn std::error::Error>> {
-    sender
-        .get_parameters()
-        .await?
-        .rtp_parameters
-        .codecs
-        .first()
-        .map(|codec| codec.payload_type)
-        .ok_or_else(|| "sender has no codec".into())
-}
-
-const H26X_FRAME_DURATION: Duration = Duration::from_millis(33);
-
-async fn stream_video(
-    path: &str,
-    track: Arc<TrackLocalStaticSample>,
-    payload_type: PayloadType,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut video_reader = H26xSampleReader::new(reader, 1_048_576, false);
-
-    let ssrc = *track.ssrcs().await.first().ok_or("track has no SSRC")?;
-
-    let mut ticker = interval(H26X_FRAME_DURATION);
-    loop {
-        let sample = match video_reader.next_sample() {
-            Ok(sample) => sample,
-            Err(e) => {
-                eprintln!("Error: {e}");
-                break;
-            }
-        };
-
-        track
-            .sample_writer(ssrc, payload_type)
-            .write_sample(&Sample {
-                data: sample.data,
-                duration: if sample.timed {
-                    H26X_FRAME_DURATION
-                } else {
-                    Duration::ZERO
-                },
-                ..Sample::new(Instant::now())
-            })
-            .await?;
-
-        if sample.timed {
-            let _ = ticker.tick().await;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    #[test]
-    fn test_validate_addr_rejects_localhost() {
-        assert_eq!(
-            validate_addr("localhost:3000"),
-            Err("Use 127.0.0.1 instead of localhost")
-        );
-        assert_eq!(
-            validate_addr("http://localhost/rooms"),
-            Err("Use 127.0.0.1 instead of localhost")
-        );
-    }
-
-    #[test]
-    fn test_validate_addr_accepts_valid_addresses() {
-        assert!(validate_addr("127.0.0.1:3000").is_ok());
-        assert!(validate_addr("192.168.1.100:8080").is_ok());
-        assert!(validate_addr("screensharing.example.com:443").is_ok());
-    }
-
-    #[test]
-    fn test_build_ws_request_success() {
-        let room = CreateRoomResponse {
-            room_id: "room-abc-123".to_string(),
-            host_token: "token-xyz-456".to_string(),
-        };
-
-        let req = build_ws_request("127.0.0.1:3000", &room).expect("should build ws request");
-
-        assert_eq!(
-            req.uri().to_string(),
-            "ws://127.0.0.1:3000/ws/host/room-abc-123"
-        );
-        assert_eq!(
-            req.headers().get(AUTHORIZATION),
-            Some(&HeaderValue::from_static("Bearer token-xyz-456"))
-        );
-    }
-
-    #[test]
-    fn test_build_ws_request_invalid_token() {
-        let room = CreateRoomResponse {
-            room_id: "room-abc-123".to_string(),
-            host_token: "invalid\ntoken\r\n".to_string(),
-        };
-
-        let result = build_ws_request("127.0.0.1:3000", &room);
-        assert_eq!(
-            result.err(),
-            Some("Invalid Authorization: Bearer <token>".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_ws_request_invalid_addr() {
-        let room = CreateRoomResponse {
-            room_id: "room-1".to_string(),
-            host_token: "token-1".to_string(),
-        };
-
-        let result = build_ws_request("invalid uri with spaces:80", &room);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("Failed to create WebSocket request")
-        );
-    }
-
-    async fn spawn_mock_http_server(
-        status_line: &'static str,
-        content_type: &'static str,
-        body: &'static str,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("should bind mock server");
-        let addr = listener.local_addr().expect("should get local address");
-        let url = format!("http://{addr}/rooms");
-
-        let handle = tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = socket.read(&mut buf).await;
-                let response = format!(
-                    "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-            }
-        });
-
-        (url, handle)
-    }
-
-    #[tokio::test]
-    async fn test_create_room_success_200_ok() {
-        let (url, _handle) = spawn_mock_http_server(
-            "200 OK",
-            "application/json",
-            r#"{"roomId":"room-123","hostToken":"token-456"}"#,
-        )
-        .await;
-
-        let client = Client::new();
-        let result = create_room(&client, &url).await;
-
-        assert_eq!(
-            result.unwrap(),
-            CreateRoomResponse {
-                room_id: "room-123".to_string(),
-                host_token: "token-456".to_string(),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_room_service_unavailable_503() {
-        let (url, _handle) =
-            spawn_mock_http_server("503 Service Unavailable", "text/plain", "").await;
-
-        let client = Client::new();
-        let result = create_room(&client, &url).await;
-
-        assert_eq!(result.unwrap_err(), "all rooms are full, try again later");
-    }
-
-    #[tokio::test]
-    async fn test_create_room_unexpected_status_404() {
-        let (url, _handle) = spawn_mock_http_server("404 Not Found", "text/plain", "").await;
-
-        let client = Client::new();
-        let result = create_room(&client, &url).await;
-
-        assert_eq!(
-            result.unwrap_err(),
-            "Error: unexpected status: 404 Not Found"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_room_invalid_json_body() {
-        let (url, _handle) =
-            spawn_mock_http_server("200 OK", "application/json", "not-valid-json").await;
-
-        let client = Client::new();
-        let result = create_room(&client, &url).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().starts_with("Error: "));
-    }
-
-    #[tokio::test]
-    async fn test_create_room_connection_failure() {
-        let client = Client::new();
-        // Connect to a port that nothing is listening on
-        let result = create_room(&client, "http://127.0.0.1:1/rooms").await;
-
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .starts_with("Server is not responding. Error: ")
-        );
-    }
-
-    fn new_test_panel() -> Panel {
-        Panel {
-            phase: Phase::Creating,
-            viewers: HashSet::new(),
-        }
-    }
-
-    #[test]
-    fn test_apply_server_message_viewer_joined() {
-        let mut panel = new_test_panel();
-
-        // 1. Insert the first viewer
-        apply_server_message(
-            &mut panel,
-            ServerToHost::ViewerJoined {
-                viewer_id: ViewerId(1),
-            },
-        );
-        assert_eq!(panel.viewers.len(), 1);
-        assert!(panel.viewers.contains(&ViewerId(1)));
-
-        // 2. Insert a second, different viewer
-        apply_server_message(
-            &mut panel,
-            ServerToHost::ViewerJoined {
-                viewer_id: ViewerId(2),
-            },
-        );
-        assert_eq!(panel.viewers.len(), 2);
-        assert!(panel.viewers.contains(&ViewerId(1)));
-        assert!(panel.viewers.contains(&ViewerId(2)));
-
-        // 3. Insert an existing viewer again (set behavior)
-        apply_server_message(
-            &mut panel,
-            ServerToHost::ViewerJoined {
-                viewer_id: ViewerId(1),
-            },
-        );
-        assert_eq!(panel.viewers.len(), 2);
-    }
-
-    #[test]
-    fn test_apply_server_message_viewer_left() {
-        let mut panel = new_test_panel();
-        panel.viewers.insert(ViewerId(1));
-        panel.viewers.insert(ViewerId(2));
-
-        // 1. Remove an existing viewer
-        apply_server_message(
-            &mut panel,
-            ServerToHost::ViewerLeft {
-                viewer_id: ViewerId(1),
-            },
-        );
-        assert_eq!(panel.viewers.len(), 1);
-        assert!(!panel.viewers.contains(&ViewerId(1)));
-        assert!(panel.viewers.contains(&ViewerId(2)));
-
-        // 2. Remove a viewer that was not there (must not panic)
-        apply_server_message(
-            &mut panel,
-            ServerToHost::ViewerLeft {
-                viewer_id: ViewerId(99),
-            },
-        );
-        assert_eq!(panel.viewers.len(), 1);
-        assert!(panel.viewers.contains(&ViewerId(2)));
-    }
-
-    #[test]
-    fn test_apply_server_message_viewer_list() {
-        let mut panel = new_test_panel();
-        panel.viewers.insert(ViewerId(99)); // previous viewer
-
-        // 1. ViewerList fully replaces the previous viewers
-        apply_server_message(
-            &mut panel,
-            ServerToHost::ViewerList {
-                viewers: vec![ViewerId(1), ViewerId(2), ViewerId(3)],
-            },
-        );
-        let expected: HashSet<ViewerId> = [ViewerId(1), ViewerId(2), ViewerId(3)]
-            .into_iter()
-            .collect();
-        assert_eq!(panel.viewers, expected);
-
-        // 2. An empty ViewerList clears the panel viewers
-        apply_server_message(&mut panel, ServerToHost::ViewerList { viewers: vec![] });
-        assert!(panel.viewers.is_empty());
-    }
-
-    #[test]
-    fn test_apply_server_message_signal_from_viewer_is_ignored() {
-        let mut panel = new_test_panel();
-        panel.viewers.insert(ViewerId(1));
-
-        // SignalFromViewer must not change the panel viewers
-        apply_server_message(
-            &mut panel,
-            ServerToHost::SignalFromViewer {
-                from: ViewerId(1),
-                message: common::SignalMessage::Offer {
-                    sdp: "v=0...".to_string(),
-                },
-            },
-        );
-
-        assert_eq!(panel.viewers.len(), 1);
-        assert!(panel.viewers.contains(&ViewerId(1)));
-    }
-
-    fn shared_panel(phase: Phase, viewers: &[ViewerId]) -> SharedPanel {
-        Arc::new(Mutex::new(Panel {
-            phase,
-            viewers: viewers.iter().copied().collect(),
-        }))
-    }
-
-    async fn status_json(panel: SharedPanel) -> serde_json::Value {
-        let Json(status) = panel_status(State(panel)).await;
-        serde_json::to_value(status).expect("status should serialize")
-    }
-
-    #[tokio::test]
-    async fn test_panel_status_creating() {
-        let panel = shared_panel(Phase::Creating, &[ViewerId(1)]);
-
-        assert_eq!(
-            status_json(panel).await,
-            serde_json::json!({ "state": "creating" })
-        );
-    }
-
-    #[tokio::test]
-    async fn test_panel_status_live_counts_viewers() {
-        let panel = shared_panel(
-            Phase::Live {
-                viewer_link: "http://127.0.0.1:3000/room/abc".to_string(),
-            },
-            &[ViewerId(1), ViewerId(2)],
-        );
-
-        assert_eq!(
-            status_json(panel).await,
-            serde_json::json!({
-                "state": "live",
-                "viewerLink": "http://127.0.0.1:3000/room/abc",
-                "viewers": 2
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn test_panel_status_error() {
-        let panel = shared_panel(
-            Phase::Error {
-                message: "boom".to_string(),
-            },
-            &[],
-        );
-
-        assert_eq!(
-            status_json(panel).await,
-            serde_json::json!({ "state": "error", "message": "boom" })
-        );
-    }
-
-    #[tokio::test]
-    async fn test_make_offer_negotiates_h264_video() {
-        let (sdp, session) = make_offer().await.expect("should create offer");
-
-        assert!(sdp.contains("m=video"));
-        assert!(sdp.contains("H264/90000"));
-        assert!(sdp.contains("profile-level-id=42e01f"));
-        assert!(sdp.contains("packetization-mode=1"));
-        assert!(!session.answered);
-        assert!(session.pending.is_empty());
-
-        let _ = session.pc.close().await;
-    }
-
-    #[tokio::test]
-    async fn test_make_offer_track_has_ssrc() {
-        let (_sdp, session) = make_offer().await.expect("should create offer");
-
-        let ssrcs = session.track.ssrcs().await;
-        assert_eq!(ssrcs.len(), 1);
-
-        let _ = session.pc.close().await;
-    }
-
-    fn temp_file_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "streamer-client-{}-{}-{name}",
-            std::process::id(),
-            rand::random::<u32>()
-        ))
-    }
-
-    #[tokio::test]
-    async fn test_stream_video_missing_file_fails() {
-        let (_sdp, session) = make_offer().await.expect("should create offer");
-        let path = temp_file_path("missing.h264");
-
-        let result = stream_video(path.to_str().unwrap(), session.track.clone(), 102).await;
-        assert!(result.is_err());
-
-        let _ = session.pc.close().await;
-    }
-
-    #[tokio::test]
-    async fn test_stream_video_empty_file_ends_ok() {
-        let (_sdp, session) = make_offer().await.expect("should create offer");
-        let path = temp_file_path("empty.h264");
-        std::fs::write(&path, []).expect("should create empty file");
-
-        let result = stream_video(path.to_str().unwrap(), session.track.clone(), 102).await;
-        let _ = std::fs::remove_file(&path);
-        assert!(result.is_ok());
-
-        let _ = session.pc.close().await;
-    }
-
-    #[tokio::test]
-    async fn test_negotiated_payload_type_uses_registered_h264() {
-        let (_sdp, session) = make_offer().await.expect("should create offer");
-
-        let payload_type = negotiated_payload_type(&session.sender)
-            .await
-            .expect("sender should have a codec");
-        assert_eq!(payload_type, 102);
-
-        let _ = session.pc.close().await;
-    }
+    sessions.insert(viewer_id, session);
+    println!("active sessions: {}", sessions.len());
+
+    let reply = HostToServer::SignalToViewer {
+        to: viewer_id,
+        message: SignalMessage::Offer { sdp },
+    };
+    serde_json::to_string(&reply).ok()
 }
