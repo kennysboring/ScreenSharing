@@ -1,0 +1,16 @@
+[package]
+name = "vaapi-encoder"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# The VA-API encoder itself. Off by default: it needs libva headers and libclang (bindgen) to
+# build, and an AMD VCE on kernel 6.18 to run. Without it only the GPU-free parts compile.
+vaapi = ["dep:libva"]
+
+[dependencies]
+# Only for its public SPS/PPS builder and writer (codec::h264); no features, so pure Rust
+cros-codecs = { version = "0.0.6", default-features = false }
+# cros-libva main: builds against libva 2.23+, has packed headers. Pinned to the commit that
+# fixed the libva 2.23 VP9 fields (2026-09-01), as validated in spikes/encoder2.
+libva = { package = "cros-libva", git = "https://github.com/chromeos/cros-libva", rev = "59384456ac2ae78c0c3e5515f41ef1efd9b802cf", optional = true }

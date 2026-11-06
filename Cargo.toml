@@ -3,7 +3,8 @@ resolver = "3"
 members = [
     "crates/signaling-server",
     "crates/streamer-client",
-    "crates/common"
+    "crates/common",
+    "crates/vaapi-encoder"
 ]
 # Experiments with system dependencies (libpipewire, libva, libclang) stay out of workspace builds
 exclude = ["spikes/capture", "spikes/encoder2"]

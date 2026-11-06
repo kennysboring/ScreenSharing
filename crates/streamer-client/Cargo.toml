@@ -17,3 +17,9 @@ rtc = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
+# VA-API encoder; needs libva headers and libclang to build (see crates/vaapi-encoder)
+vaapi-encoder = { path = "../vaapi-encoder", optional = true }
+
+[features]
+# `--source vaapi-test`: live H.264 encode of synthetic frames on the GPU (kernel 6.18 only)
+vaapi = ["dep:vaapi-encoder", "vaapi-encoder/vaapi"]

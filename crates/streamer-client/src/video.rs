@@ -43,26 +43,90 @@ pub struct EncodedFrame {
     pub timed: bool,
 }
 
+/// What a session needs from the shared frame source: the frames, and a way to ask for a
+/// keyframe. Only a live encoder can honor that request; the test file cannot.
+#[derive(Clone)]
+pub struct FrameSource {
+    frames: broadcast::Sender<EncodedFrame>,
+    keyframes: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl FrameSource {
+    pub fn new(
+        frames: broadcast::Sender<EncodedFrame>,
+        keyframes: Option<std::sync::mpsc::Sender<()>>,
+    ) -> Self {
+        Self { frames, keyframes }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<EncodedFrame> {
+        self.frames.subscribe()
+    }
+
+    /// Asks the source for an IDR soon (it rate limits them). A no-op for sources that cannot
+    /// produce one, or when the encoder thread is gone.
+    pub fn request_keyframe(&self) {
+        if let Some(keyframes) = &self.keyframes {
+            let _ = keyframes.send(());
+        }
+    }
+}
+
+/// Synthetic VA-API source: 30 fps to match `H26X_FRAME_DURATION`, which `forward_frames` uses
+/// as the duration of every timed frame.
+#[cfg(feature = "vaapi")]
+const VAAPI_TEST_FPS: u32 = 30;
+
+/// Starts the VA-API encoder thread on synthetic 1080p frames: a periodic IDR every 2 s and at
+/// most one requested IDR per second. Fails if the encoder cannot be opened, including on a
+/// kernel other than 6.18.
+#[cfg(feature = "vaapi")]
+pub fn start_vaapi_test_source(
+    frames: broadcast::Sender<EncodedFrame>,
+) -> Result<FrameSource, String> {
+    let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel();
+    let config = vaapi_encoder::vaapi::Config {
+        width: 1920,
+        height: 1080,
+        fps: VAAPI_TEST_FPS,
+        gop_frames: 2 * VAAPI_TEST_FPS,
+        min_forced_idr_interval: Duration::from_secs(1),
+    };
+    let publish = frames.clone();
+    // The thread runs for the life of the process; its handle is not needed
+    vaapi_encoder::vaapi::spawn_test_source(config, keyframe_rx, move |nal| {
+        // No receivers is not an error: the encoder keeps its pace for whoever joins later
+        let _ = publish.send(EncodedFrame {
+            data: Bytes::from(nal.data),
+            timed: nal.timed,
+        });
+    })
+    .map_err(|e| format!("VA-API source: {e}"))?;
+    Ok(FrameSource::new(frames, Some(keyframe_tx)))
+}
+
 pub const TEST_VIDEO_PATH: &str = "test-assets/test.h264";
 const H26X_FRAME_DURATION: Duration = Duration::from_millis(33);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Once the connection is up, subscribes this session to the shared frame source and sends the
-/// frames to its track, starting at the next keyframe. Gives up if it does not connect within
-/// `CONNECT_TIMEOUT`.
+/// Once the connection is up, subscribes this session to the shared frame source, asks it for a
+/// keyframe and sends the frames to its track, starting at the next keyframe. Gives up if it
+/// does not connect within `CONNECT_TIMEOUT`.
 pub fn start_session_video(
     track: Arc<TrackLocalStaticSample>,
     payload_type: PayloadType,
     mut connected_rx: Receiver<()>,
-    frames_tx: broadcast::Sender<EncodedFrame>,
+    source: FrameSource,
 ) {
     tokio::spawn(async move {
         match tokio::time::timeout(CONNECT_TIMEOUT, connected_rx.recv()).await {
             Ok(Some(())) => {
                 // Subscribe only now, so no frames pile up while ICE is negotiating
-                let frames_rx = frames_tx.subscribe();
+                let frames_rx = source.subscribe();
+                // A live encoder starts a new GOP for us instead of making us wait for one
+                source.request_keyframe();
                 // Holding a sender here would keep the channel from ever closing
-                drop(frames_tx);
+                drop(source);
 
                 let Some(&ssrc) = track.ssrcs().await.first() else {
                     println!("Track has no SSRC");
@@ -489,5 +553,41 @@ mod tests {
         assert_eq!(result, Err("write failed"));
         assert_eq!(calls, 1, "nothing is written after the first failure");
         drop(tx);
+    }
+
+    #[test]
+    fn test_frame_source_forwards_keyframe_requests() {
+        let (frames, _) = broadcast::channel(1);
+        let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel();
+        let source = FrameSource::new(frames, Some(keyframe_tx));
+
+        source.clone().request_keyframe();
+        source.request_keyframe();
+
+        assert_eq!(keyframe_rx.try_iter().count(), 2);
+    }
+
+    #[test]
+    fn test_frame_source_without_encoder_ignores_requests() {
+        let (frames, _) = broadcast::channel(1);
+        // The file source: nothing to ask, nothing to fail
+        FrameSource::new(frames.clone(), None).request_keyframe();
+
+        // An encoder thread that is gone: the request is dropped, not a panic
+        let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel();
+        drop(keyframe_rx);
+        FrameSource::new(frames, Some(keyframe_tx)).request_keyframe();
+    }
+
+    #[tokio::test]
+    async fn test_frame_source_subscribers_get_the_frames() {
+        let (frames, _) = broadcast::channel(4);
+        let source = FrameSource::new(frames.clone(), None);
+        let mut rx = source.subscribe();
+
+        send(&frames, frame(0x67, false));
+
+        let received = recv_frame(&mut rx).await.expect("channel should stay open");
+        assert_eq!(nal_type(&received.data), Some(7));
     }
 }
