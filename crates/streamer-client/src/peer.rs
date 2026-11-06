@@ -95,6 +95,14 @@ impl Session {
     }
 }
 
+/// H.264 fmtp for Constrained Baseline at `level` (level_idc). profile-level-id is
+/// profile_idc 0x42 (Baseline), constraint flags 0xe0 (set0, set1 = Constrained, set2) and the
+/// level. Codecs match on the first two bytes only, so the level can differ from the browser's;
+/// with level-asymmetry-allowed each side's level is what that side can receive.
+fn h264_fmtp_line(level: u8) -> String {
+    format!("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e0{level:02x}")
+}
+
 pub async fn make_offer(
     source: FrameSource,
 ) -> Result<(String, Session), Box<dyn std::error::Error>> {
@@ -110,8 +118,7 @@ pub async fn make_offer(
             mime_type: MIME_TYPE_H264.to_owned(),
             clock_rate: 90000,
             channels: 0,
-            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                .to_owned(),
+            sdp_fmtp_line: h264_fmtp_line(source.h264_level()),
             rtcp_feedback: vec![],
         },
         payload_type: 102,
@@ -191,10 +198,32 @@ mod tests {
     use tokio::sync::broadcast;
     use webrtc::media_stream::Track;
 
-    /// A source nobody listens to and that cannot produce keyframes.
+    /// A source nobody listens to and that cannot produce keyframes, at the test file's level.
     fn test_source() -> FrameSource {
+        source_at_level(crate::video::TEST_VIDEO_H264_LEVEL)
+    }
+
+    fn source_at_level(level: u8) -> FrameSource {
         let (frames, _) = broadcast::channel(1);
-        FrameSource::new(frames, None)
+        FrameSource::new(frames, None, level)
+    }
+
+    #[test]
+    fn test_h264_fmtp_line_carries_the_level() {
+        assert_eq!(
+            h264_fmtp_line(0x1f),
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+        );
+        assert!(h264_fmtp_line(40).ends_with("profile-level-id=42e028"));
+    }
+
+    #[tokio::test]
+    async fn test_make_offer_announces_the_source_level() {
+        let (sdp, session) = make_offer(source_at_level(40))
+            .await
+            .expect("should create offer");
+        assert!(sdp.contains("profile-level-id=42e028"));
+        let _ = session.pc.close().await;
     }
 
     #[tokio::test]

@@ -43,20 +43,35 @@ pub struct EncodedFrame {
     pub timed: bool,
 }
 
-/// What a session needs from the shared frame source: the frames, and a way to ask for a
-/// keyframe. Only a live encoder can honor that request; the test file cannot.
+/// H.264 level of `TEST_VIDEO_PATH`: its SPS starts `42 c0 1f`, level_idc 31 (3.1).
+pub const TEST_VIDEO_H264_LEVEL: u8 = 0x1f;
+
+/// What a session needs from the shared frame source: the frames, the H.264 level they are
+/// encoded at (announced in the SDP offer), and a way to ask for a keyframe. Only a live encoder
+/// can honor that request; the test file cannot.
 #[derive(Clone)]
 pub struct FrameSource {
     frames: broadcast::Sender<EncodedFrame>,
     keyframes: Option<std::sync::mpsc::Sender<()>>,
+    h264_level: u8,
 }
 
 impl FrameSource {
     pub fn new(
         frames: broadcast::Sender<EncodedFrame>,
         keyframes: Option<std::sync::mpsc::Sender<()>>,
+        h264_level: u8,
     ) -> Self {
-        Self { frames, keyframes }
+        Self {
+            frames,
+            keyframes,
+            h264_level,
+        }
+    }
+
+    /// level_idc of the stream (for example 31 for 3.1, 40 for 4.0).
+    pub fn h264_level(&self) -> u8 {
+        self.h264_level
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<EncodedFrame> {
@@ -85,9 +100,10 @@ pub fn start_vaapi_test_source(
     frames: broadcast::Sender<EncodedFrame>,
 ) -> Result<FrameSource, String> {
     let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel();
+    let (width, height) = (1920, 1080);
     let config = vaapi_encoder::vaapi::Config {
-        width: 1920,
-        height: 1080,
+        width,
+        height,
         fps: VAAPI_TEST_FPS,
         gop_frames: 2 * VAAPI_TEST_FPS,
         min_forced_idr_interval: Duration::from_secs(1),
@@ -102,7 +118,9 @@ pub fn start_vaapi_test_source(
         });
     })
     .map_err(|e| format!("VA-API source: {e}"))?;
-    Ok(FrameSource::new(frames, Some(keyframe_tx)))
+    // The same level the encoder writes in its SPS (4.0 for 1080p30)
+    let level = vaapi_encoder::bitstream::level_for(width, height, VAAPI_TEST_FPS) as u8;
+    Ok(FrameSource::new(frames, Some(keyframe_tx), level))
 }
 
 pub const TEST_VIDEO_PATH: &str = "test-assets/test.h264";
@@ -559,7 +577,7 @@ mod tests {
     fn test_frame_source_forwards_keyframe_requests() {
         let (frames, _) = broadcast::channel(1);
         let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel();
-        let source = FrameSource::new(frames, Some(keyframe_tx));
+        let source = FrameSource::new(frames, Some(keyframe_tx), TEST_VIDEO_H264_LEVEL);
 
         source.clone().request_keyframe();
         source.request_keyframe();
@@ -571,18 +589,18 @@ mod tests {
     fn test_frame_source_without_encoder_ignores_requests() {
         let (frames, _) = broadcast::channel(1);
         // The file source: nothing to ask, nothing to fail
-        FrameSource::new(frames.clone(), None).request_keyframe();
+        FrameSource::new(frames.clone(), None, TEST_VIDEO_H264_LEVEL).request_keyframe();
 
         // An encoder thread that is gone: the request is dropped, not a panic
         let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel();
         drop(keyframe_rx);
-        FrameSource::new(frames, Some(keyframe_tx)).request_keyframe();
+        FrameSource::new(frames, Some(keyframe_tx), TEST_VIDEO_H264_LEVEL).request_keyframe();
     }
 
     #[tokio::test]
     async fn test_frame_source_subscribers_get_the_frames() {
         let (frames, _) = broadcast::channel(4);
-        let source = FrameSource::new(frames.clone(), None);
+        let source = FrameSource::new(frames.clone(), None, TEST_VIDEO_H264_LEVEL);
         let mut rx = source.subscribe();
 
         send(&frames, frame(0x67, false));

@@ -20,7 +20,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Error::Http, Message},
 };
-use video::{EncodedFrame, FrameSource, TEST_VIDEO_PATH, start_test_source};
+use video::{EncodedFrame, FrameSource, TEST_VIDEO_H264_LEVEL, TEST_VIDEO_PATH, start_test_source};
 use webrtc::peer_connection::RTCIceCandidateInit;
 
 /// Frames the source can be ahead of the slowest session before that session lags
@@ -66,7 +66,7 @@ fn start_source(
     match kind {
         SourceKind::File => {
             start_test_source(frames.clone(), TEST_VIDEO_PATH.to_owned());
-            Ok(FrameSource::new(frames, None))
+            Ok(FrameSource::new(frames, None, TEST_VIDEO_H264_LEVEL))
         }
         #[cfg(feature = "vaapi")]
         SourceKind::VaapiTest => video::start_vaapi_test_source(frames),
