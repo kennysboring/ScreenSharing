@@ -12,12 +12,19 @@
 //! - `--encode-ippp [--frames N] [--gop N] [--force-idr-at N] [--size WxH]`: encodes an IPPP
 //!   sequence to `out-ippp.h264`.
 //!
-//! Both encode modes refuse to run unless the kernel is 6.18 LTS: on 7.2.2+ H.264 encode hangs
-//! the RX 580's VCE.
+//! - `--vpp-only [--size WxH]`: imports a GBM XRGB8888 buffer, converts it to NV12 with the VPP
+//!   and checks the colors on the CPU (VideoProc only, nothing reaches the VCE);
+//! - `--encode-vpp [--frames N] [--gop N] [--size WxH]`: the VPP output feeds the IPPP encoder,
+//!   written to `out-vpp.h264` with BT.709 limited range in the SPS VUI;
+//! - `--psnr-bars <decoded.yuv> [--frames N] [--size WxH]`: CPU only, PSNR against the pattern.
+//!
+//! Every mode that touches the GPU refuses to run unless the kernel is 6.18 LTS: on 7.2.2+
+//! H.264 encode hangs the RX 580's VCE.
 
 mod encode;
 mod query;
 mod sequence;
+mod vpp;
 
 use libva::Display;
 
@@ -29,6 +36,9 @@ const SAFE_KERNEL_PREFIX: &str = "6.18.";
 fn main() -> Result<(), Error> {
     let mut encode_idr = false;
     let mut encode_ippp = false;
+    let mut vpp_only = false;
+    let mut encode_vpp = false;
+    let mut psnr_bars: Option<String> = None;
     let mut prepend = false;
     let mut psnr_file: Option<String> = None;
     let mut opts = encode::Options {
@@ -42,12 +52,16 @@ fn main() -> Result<(), Error> {
         frames: 120,
         gop: 30,
         force_idr_at: None,
+        bt709_vui: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--encode-idr" => encode_idr = true,
             "--encode-ippp" => encode_ippp = true,
+            "--vpp-only" => vpp_only = true,
+            "--encode-vpp" => encode_vpp = true,
+            "--psnr-bars" => psnr_bars = Some(args.next().ok_or("--psnr-bars needs a file")?),
             "--prepend" => prepend = true,
             "--psnr" => psnr_file = Some(args.next().ok_or("--psnr needs a file")?),
             "--no-packed-headers" => opts.packed_headers = false,
@@ -72,6 +86,9 @@ fn main() -> Result<(), Error> {
     // CPU-only modes, checked before VA-API is opened
     if let Some(path) = psnr_file {
         return sequence::verify_psnr(&path, &seq);
+    }
+    if let Some(path) = psnr_bars {
+        return vpp::verify_bars_psnr(&path, seq.width, seq.height, seq.frames);
     }
     if prepend {
         // SPS + PPS (same values the encoder sent to VA) followed by the slice the driver wrote
@@ -102,8 +119,8 @@ fn main() -> Result<(), Error> {
     if (encode_ippp || opts.packed_headers) && caps.packed_headers & needed != needed {
         return Err("the driver does not accept packed SPS/PPS/slice headers".into());
     }
-    if !encode_idr && !encode_ippp {
-        println!("query only; pass --encode-idr or --encode-ippp to encode");
+    if !encode_idr && !encode_ippp && !vpp_only && !encode_vpp {
+        println!("query only; pass --encode-idr, --encode-ippp, --vpp-only or --encode-vpp");
         return Ok(());
     }
 
@@ -115,6 +132,21 @@ fn main() -> Result<(), Error> {
              H.264 encode hangs the VCE on 7.2.2+"
         )
         .into());
+    }
+    if vpp_only {
+        println!(
+            "VPP only (no encoder), {}x{} on kernel {release}",
+            seq.width, seq.height
+        );
+        return vpp::vpp_only(display, seq.width, seq.height);
+    }
+    if encode_vpp {
+        seq.bt709_vui = true;
+        println!(
+            "encoding {} frames IPPP from the VPP, {}x{}, IDR every {} on kernel {release}",
+            seq.frames, seq.width, seq.height, seq.gop
+        );
+        return vpp::encode_vpp(display, &seq);
     }
     if encode_ippp {
         println!(

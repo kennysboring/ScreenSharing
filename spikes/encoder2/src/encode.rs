@@ -76,6 +76,16 @@ pub fn nal_types(stream: &[u8]) -> Vec<u8> {
 /// The one SPS/PPS used everywhere: to fill the VA parameter buffers, as packed headers, and when
 /// prepending headers to a driver-written slice. Sharing it keeps those from drifting apart.
 pub fn build_headers(width: u32, height: u32) -> Result<(Rc<Sps>, Rc<Pps>), Error> {
+    build_headers_with(width, height, false)
+}
+
+/// [`build_headers`], optionally declaring BT.709 limited range in the SPS VUI. The VA sequence
+/// buffer has no colour fields: Mesa reads them from the packed SPS and writes them in its own.
+pub fn build_headers_with(
+    width: u32,
+    height: u32,
+    bt709_vui: bool,
+) -> Result<(Rc<Sps>, Rc<Pps>), Error> {
     // frame_mbs_only and chroma_format must be set before resolution(), which computes the crop
     let mut sps = SpsBuilder::new()
         .seq_parameter_set_id(0)
@@ -95,6 +105,27 @@ pub fn build_headers(width: u32, height: u32) -> Result<(Rc<Sps>, Rc<Pps>), Erro
     let sps_mut = Rc::get_mut(&mut sps).ok_or("SPS is shared")?;
     sps_mut.constraint_set0_flag = true;
     sps_mut.constraint_set1_flag = true;
+    if bt709_vui {
+        // VUI with only the video signal type: limited range (16-235), BT.709 primaries,
+        // transfer and matrix (H.264 Table E-3/E-4/E-5 value 1); every other VUI part absent
+        sps_mut.vui_parameters_present_flag = true;
+        let vui = &mut sps_mut.vui_parameters;
+        vui.aspect_ratio_info_present_flag = false;
+        vui.overscan_info_present_flag = false;
+        vui.video_signal_type_present_flag = true;
+        vui.video_format = 5; // unspecified
+        vui.video_full_range_flag = false;
+        vui.colour_description_present_flag = true;
+        vui.colour_primaries = 1;
+        vui.transfer_characteristics = 1;
+        vui.matrix_coefficients = 1;
+        vui.chroma_loc_info_present_flag = false;
+        vui.timing_info_present_flag = false;
+        vui.nal_hrd_parameters_present_flag = false;
+        vui.vcl_hrd_parameters_present_flag = false;
+        vui.pic_struct_present_flag = false;
+        vui.bitstream_restriction_flag = false;
+    }
     let pps = PpsBuilder::new(Rc::clone(&sps))
         .pic_parameter_set_id(0)
         .pic_init_qp(QP)

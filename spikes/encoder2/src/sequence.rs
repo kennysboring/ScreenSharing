@@ -5,7 +5,7 @@
 //! `verify_psnr` (CPU only) compares a decoded yuv420p file with the same synthetic frames.
 
 use crate::encode::{
-    QP, build_headers, header_bytes, invalid_pic, synthesize_pps, synthesize_sps, ue_bits,
+    QP, build_headers_with, header_bytes, invalid_pic, synthesize_pps, synthesize_sps, ue_bits,
 };
 use crate::query::{ENTRYPOINT, PROFILE};
 use cros_codecs::codec::h264::{nalu_writer::NaluWriter, parser::Sps};
@@ -13,8 +13,8 @@ use libva::{
     BufferType, Display, EncPackedHeaderParameter, EncPackedHeaderType, EncPictureParameter,
     EncPictureParameterBufferH264, EncSequenceParameter, EncSequenceParameterBufferH264,
     EncSliceParameter, EncSliceParameterBufferH264, H264EncFrameCropOffsets, H264EncPicFields,
-    H264EncSeqFields, Image, MappedCodedBuffer, Picture, PictureH264, UsageHint, VAConfigAttrib,
-    VAConfigAttribType,
+    H264EncSeqFields, H264VuiFields, Image, MappedCodedBuffer, Picture, PictureH264, Surface,
+    UsageHint, VAConfigAttrib, VAConfigAttribType,
 };
 use std::{
     fs::File,
@@ -39,6 +39,8 @@ pub struct SeqOptions {
     pub frames: u32,
     pub gop: u32,
     pub force_idr_at: Option<u32>,
+    /// Declare BT.709 limited range in the SPS VUI
+    pub bt709_vui: bool,
 }
 
 impl SeqOptions {
@@ -160,6 +162,10 @@ fn slice_header(idr: bool, frame_num: u32, idr_pic_id: u32) -> Result<(Vec<u8>, 
 }
 
 fn seq_param(sps: &Sps, mb_w: u32, mb_h: u32, gop: u32) -> EncSequenceParameterBufferH264 {
+    // The VA buffer only says that a VUI exists; its colour fields come from the packed SPS
+    let vui = sps
+        .vui_parameters_present_flag
+        .then(|| H264VuiFields::new(0, 0, 0, 0, 0, 0, 0, 0));
     let seq_fields = H264EncSeqFields::new(
         u32::from(sps.chroma_format_idc),
         u32::from(sps.frame_mbs_only_flag),
@@ -197,7 +203,7 @@ fn seq_param(sps: &Sps, mb_w: u32, mb_h: u32, gop: u32) -> EncSequenceParameterB
         0,
         [0; 256],
         crop,
-        None,
+        vui,
         0,
         0,
         0,
@@ -211,14 +217,14 @@ struct Stats {
 }
 
 impl Stats {
-    fn report(&self) {
+    fn report(&self, label: &str) {
         let mut sorted = self.durations.clone();
         sorted.sort();
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
         let pick = |q: f64| sorted[((sorted.len() - 1) as f64 * q).round() as usize];
         let mean = sorted.iter().sum::<Duration>() / sorted.len() as u32;
         println!(
-            "encode time per frame ({} frames): median {:.2} ms, p99 {:.2} ms, worst {:.2} ms, \
+            "{label} per frame ({} frames): median {:.2} ms, p99 {:.2} ms, worst {:.2} ms, \
              mean {:.2} ms",
             sorted.len(),
             ms(pick(0.5)),
@@ -233,14 +239,57 @@ impl Stats {
             .max_by_key(|(_, d)| **d)
             .map(|(i, _)| i)
             .unwrap_or(0);
-        println!("worst frame index: {worst}");
+        println!("  worst frame index: {worst}");
     }
 }
 
+/// IPPP with synthetic content written into the input surface by the CPU.
 pub fn encode_sequence(display: Rc<Display>, opts: &SeqOptions) -> Result<(), Error> {
+    // The input surface has the picture size (see encode_sequence_with)
+    let (coded_w, coded_h) = (opts.width, opts.height);
+    let nv12 = display
+        .query_image_formats()?
+        .into_iter()
+        .find(|f| f.fourcc == libva::VA_FOURCC_NV12)
+        .ok_or("driver has no NV12 image format")?;
+    let mut fill = |index: u32, input: &Surface<()>| -> Result<(), Error> {
+        {
+            let mut image =
+                Image::create_from(input, nv12, (coded_w, coded_h), (coded_w, coded_h))?;
+            fill_frame(
+                &mut image,
+                coded_w as usize,
+                coded_h as usize,
+                index as usize,
+            );
+        }
+        input.sync()?;
+        Ok(())
+    };
+    encode_sequence_with(
+        display,
+        opts,
+        &mut fill,
+        "prepare (CPU fill)",
+        "out-ippp.h264",
+    )
+}
+
+/// Fills the encoder's NV12 input surface for frame `index`.
+pub type PrepareInput<'a> = dyn FnMut(u32, &Surface<()>) -> Result<(), Error> + 'a;
+
+/// IPPP encode where `prepare` fills the NV12 input surface for each frame (CPU upload, or VPP
+/// writing into it); its time is reported separately from the encode time.
+pub fn encode_sequence_with(
+    display: Rc<Display>,
+    opts: &SeqOptions,
+    prepare: &mut PrepareInput,
+    prepare_label: &str,
+    out_name: &str,
+) -> Result<(), Error> {
     let (mb_w, mb_h) = (opts.width.div_ceil(16), opts.height.div_ceil(16));
     let (coded_w, coded_h) = (mb_w * 16, mb_h * 16);
-    let (sps, pps) = build_headers(opts.width, opts.height)?;
+    let (sps, pps) = build_headers_with(opts.width, opts.height, opts.bt709_vui)?;
 
     let config = display.create_config(
         vec![
@@ -262,22 +311,27 @@ pub fn encode_sequence(display: Rc<Display>, opts: &SeqOptions) -> Result<(), Er
         PROFILE,
         ENTRYPOINT,
     )?;
-    // [0] input, [1] and [2] reconstructions that alternate: current and reference
-    let surfaces = display.create_surfaces(
+    // [0] input, [1] and [2] reconstructions that alternate: current and reference. The input
+    // has the picture size (1080 rows, as a capture delivers it, and what the VPP writes 1:1);
+    // the reconstructions and the context use the 16-aligned coded size, and the SPS crops.
+    let mut surfaces = display.create_surfaces(
+        libva::VA_RT_FORMAT_YUV420,
+        Some(libva::VA_FOURCC_NV12),
+        opts.width,
+        opts.height,
+        Some(UsageHint::USAGE_HINT_ENCODER | UsageHint::USAGE_HINT_VPP_WRITE),
+        vec![()],
+    )?;
+    surfaces.extend(display.create_surfaces(
         libva::VA_RT_FORMAT_YUV420,
         Some(libva::VA_FOURCC_NV12),
         coded_w,
         coded_h,
         Some(UsageHint::USAGE_HINT_ENCODER),
-        vec![(), (), ()],
-    )?;
+        vec![(), ()],
+    )?);
     let context = display.create_context(&config, coded_w, coded_h, Some(&surfaces), true)?;
     let coded = context.create_enc_coded((coded_w * coded_h * 3 / 2) as usize)?;
-    let nv12 = display
-        .query_image_formats()?
-        .into_iter()
-        .find(|f| f.fourcc == libva::VA_FOURCC_NV12)
-        .ok_or("driver has no NV12 image format")?;
 
     // Our SPS/PPS as NALs, only used if the driver ever returns an IDR without them
     let fallback_headers: Vec<Vec<u8>> = split_nals(&header_bytes(&sps, &pps)?)
@@ -293,7 +347,9 @@ pub fn encode_sequence(display: Rc<Display>, opts: &SeqOptions) -> Result<(), Er
     let mut stats = Stats {
         durations: Vec::with_capacity(opts.frames as usize),
     };
-    let mut prepare = Duration::ZERO;
+    let mut prepare_stats = Stats {
+        durations: Vec::with_capacity(opts.frames as usize),
+    };
     let mut out_nals: Vec<Nal> = Vec::new();
 
     for index in 0..opts.frames {
@@ -309,20 +365,10 @@ pub fn encode_sequence(display: Rc<Display>, opts: &SeqOptions) -> Result<(), Er
         let reference_index = 3 - recon_index; // the other reconstruction surface
         let (recon, reference) = (&surfaces[recon_index], &surfaces[reference_index]);
 
-        // Not timed: synthetic content
+        // Timed apart from the encode: producing the input (CPU fill or VPP)
         let t = Instant::now();
-        {
-            let mut image =
-                Image::create_from(input, nv12, (coded_w, coded_h), (coded_w, coded_h))?;
-            fill_frame(
-                &mut image,
-                coded_w as usize,
-                coded_h as usize,
-                index as usize,
-            );
-        }
-        input.sync()?;
-        prepare += t.elapsed();
+        prepare(index, input).map_err(|e| format!("preparing frame {index}: {e}"))?;
+        prepare_stats.durations.push(t.elapsed());
 
         // Timed: buffers, encode, sync and reading the coded buffer
         let t = Instant::now();
@@ -489,7 +535,7 @@ pub fn encode_sequence(display: Rc<Display>, opts: &SeqOptions) -> Result<(), Er
         recon_index = reference_index;
     }
 
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("out-ippp.h264");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(out_name);
     let mut file = File::create(&path)?;
     let mut total = 0usize;
     for nal in &out_nals {
@@ -504,11 +550,9 @@ pub fn encode_sequence(display: Rc<Display>, opts: &SeqOptions) -> Result<(), Er
         out_nals.len() - timed,
         path.display()
     );
-    println!(
-        "IDRs without driver SPS/PPS (prepended): {prepended}; prepare (not timed) {:.2} ms/frame",
-        prepare.as_secs_f64() * 1000.0 / f64::from(opts.frames)
-    );
-    stats.report();
+    println!("IDRs without driver SPS/PPS (prepended): {prepended}");
+    prepare_stats.report(prepare_label);
+    stats.report("encode");
     Ok(())
 }
 

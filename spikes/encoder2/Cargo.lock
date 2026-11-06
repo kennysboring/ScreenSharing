@@ -97,6 +97,16 @@ version = "0.1.0"
 dependencies = [
  "cros-codecs",
  "cros-libva",
+ "gbm-sys",
+]
+
+[[package]]
+name = "gbm-sys"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cc2f64de9fa707b5c6b2d2f10d7a7e49e845018a9f5685891eb40d3bab2538"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

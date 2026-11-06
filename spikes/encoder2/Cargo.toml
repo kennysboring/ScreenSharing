@@ -10,3 +10,5 @@ publish = false
 libva = { package = "cros-libva", git = "https://github.com/chromeos/cros-libva", rev = "59384456ac2ae78c0c3e5515f41ef1efd9b802cf" }
 # Only for its public SPS/PPS builder and writer (codec::h264); no features, so no libva/GBM
 cros-codecs = { version = "0.0.6", default-features = false }
+# GBM to allocate the XRGB8888 DMA-BUF the VPP mode imports (Mesa's GBM allocates this format)
+gbm-sys = "0.3.1"
