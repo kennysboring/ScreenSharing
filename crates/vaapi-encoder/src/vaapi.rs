@@ -11,6 +11,7 @@ use crate::{
         sps_bytes,
     },
     kernel,
+    pacer::{FramePacer, KEEPALIVE},
     schedule::IdrScheduler,
     synthetic,
 };
@@ -481,11 +482,13 @@ impl Encoder {
 /// NAL and the pts of its picture (time since the source started, taken when the frame is
 /// produced, so a frame delayed by a stall gets the time it really has).
 /// A message on `keyframe_requests` asks for an IDR, rate limited by
-/// `config.min_forced_idr_interval`. Returns once the encoder is open, or with the error that
-/// prevented opening it.
+/// `config.min_forced_idr_interval`. While `has_receivers` says nobody listens, nothing is
+/// produced or encoded; the first frame after that is an IDR (see [`FramePacer`]).
+/// Returns once the encoder is open, or with the error that prevented opening it.
 pub fn spawn_test_source(
     config: Config,
     keyframe_requests: mpsc::Receiver<()>,
+    has_receivers: impl Fn() -> bool + Send + 'static,
     mut publish: impl FnMut(Nal, Duration) + Send + 'static,
 ) -> Result<thread::JoinHandle<()>, Error> {
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
@@ -502,28 +505,49 @@ pub fn spawn_test_source(
                     return;
                 }
             };
-            let mut scheduler =
-                IdrScheduler::new(config.gop_frames, config.min_forced_idr_interval);
+            // The loop below paces the frames; the pacer's cap is only a guard against bursts,
+            // above fps so a tick on time after a late one is not held back
+            let mut pacer = FramePacer::new(
+                2 * config.fps,
+                KEEPALIVE,
+                IdrScheduler::new(config.gop_frames, config.min_forced_idr_interval),
+            );
             let period = Duration::from_secs(1) / config.fps;
             let start = Instant::now();
             let mut next = start;
             for index in 0u32.. {
                 // Requests from sessions that just subscribed (later also PLIs)
                 while keyframe_requests.try_recv().is_ok() {
-                    scheduler.request();
+                    pacer.request_keyframe();
                 }
-                let now = Instant::now();
-                let pts = now - start;
-                let idr = scheduler.next_is_idr(pts);
-                let result = encoder
-                    .upload_synthetic(index)
-                    .and_then(|()| encoder.encode(index, idr));
-                match result {
-                    Ok(nals) => nals.into_iter().for_each(|nal| publish(nal, pts)),
-                    Err(e) => {
-                        eprintln!("vaapi: encoding frame {index} failed: {e}; stopping");
-                        return;
+                let was_idle = pacer.is_idle();
+                pacer.set_receivers(has_receivers());
+                if pacer.is_idle() != was_idle {
+                    eprintln!(
+                        "vaapi: {}",
+                        if was_idle {
+                            "a receiver joined, resuming with an IDR"
+                        } else {
+                            "no receivers, encoder idle"
+                        }
+                    );
+                }
+                let now = start.elapsed();
+                let result = (|| {
+                    if !pacer.is_idle() {
+                        encoder.upload_synthetic(index)?;
+                        pacer.frame_arrived(now);
                     }
+                    let Some(frame) = pacer.poll(now) else {
+                        return Ok(());
+                    };
+                    let nals = encoder.encode(index, frame.idr)?;
+                    nals.into_iter().for_each(|nal| publish(nal, frame.pts));
+                    Ok::<(), Error>(())
+                })();
+                if let Err(e) = result {
+                    eprintln!("vaapi: encoding frame {index} failed: {e}; stopping");
+                    return;
                 }
 
                 // Fixed rate from the start time; after a stall, resynchronize instead of

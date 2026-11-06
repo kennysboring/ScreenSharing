@@ -139,9 +139,13 @@ pub fn start_vaapi_test_source(
         bt709_vui: true,
     };
     let publish = frames.clone();
+    // With no session subscribed the encoder idles; the first subscriber's keyframe request
+    // wakes it with an IDR
+    let watch = frames.clone();
+    let has_receivers = move || watch.receiver_count() > 0;
     // The thread runs for the life of the process; its handle is not needed
-    vaapi_encoder::vaapi::spawn_test_source(config, keyframe_rx, move |nal, pts| {
-        // No receivers is not an error: the encoder keeps its pace for whoever joins later
+    vaapi_encoder::vaapi::spawn_test_source(config, keyframe_rx, has_receivers, move |nal, pts| {
+        // Fails only if the last session left after the encoder checked: nothing to do
         let _ = publish.send(EncodedFrame {
             data: Bytes::from(nal.data),
             pts,
