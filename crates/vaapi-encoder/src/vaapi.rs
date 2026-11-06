@@ -19,9 +19,9 @@ use libva::{
     BufferType, Config as VaConfig, Context, Display, EncCodedBuffer, EncPackedHeaderParameter,
     EncPackedHeaderType, EncPictureParameter, EncPictureParameterBufferH264, EncSequenceParameter,
     EncSequenceParameterBufferH264, EncSliceParameter, EncSliceParameterBufferH264,
-    H264EncFrameCropOffsets, H264EncPicFields, H264EncSeqFields, Image, MappedCodedBuffer, Picture,
-    PictureH264, Surface, UsageHint, VAConfigAttrib, VAConfigAttribType, VAEntrypoint,
-    VAImageFormat, VAProfile,
+    H264EncFrameCropOffsets, H264EncPicFields, H264EncSeqFields, H264VuiFields, Image,
+    MappedCodedBuffer, Picture, PictureH264, Surface, UsageHint, VAConfigAttrib,
+    VAConfigAttribType, VAEntrypoint, VAImageFormat, VAProfile,
 };
 use std::{
     rc::Rc,
@@ -48,6 +48,9 @@ pub struct Config {
     pub gop_frames: u32,
     /// Requested IDRs closer than this to the previous IDR wait until it has passed.
     pub min_forced_idr_interval: Duration,
+    /// Declare BT.709 limited range in the SPS VUI: what the VPP writes from a capture. Without
+    /// it the colour space is unspecified and each browser guesses.
+    pub bt709_vui: bool,
 }
 
 impl Config {
@@ -89,7 +92,9 @@ pub struct Encoder {
     config: Config,
     _va_config: VaConfig,
     context: Rc<Context>,
-    /// [0] input, [1] and [2] reconstructions that alternate: current and reference
+    /// [0] input, at the picture size: a capture has 1080 rows and the VPP writes it 1:1.
+    /// [1] and [2] reconstructions that alternate (current and reference), at the 16-aligned
+    /// coded size like the context; the SPS crops the difference.
     surfaces: Vec<Surface<()>>,
     coded: EncCodedBuffer,
     nv12: VAImageFormat,
@@ -103,6 +108,7 @@ pub struct Encoder {
     encoded_idrs: u32,
     /// Our SPS/PPS as NALs, used only if the driver returns an IDR without them
     fallback_headers: Vec<Vec<u8>>,
+    display: Rc<Display>,
 }
 
 impl Encoder {
@@ -149,7 +155,7 @@ impl Encoder {
         let (mb_w, mb_h) = (config.width.div_ceil(16), config.height.div_ceil(16));
         let (coded_w, coded_h) = (mb_w * 16, mb_h * 16);
         let level = level_for(config.width, config.height, config.fps);
-        let (sps, pps) = build_headers(config.width, config.height, level)?;
+        let (sps, pps) = build_headers(config.width, config.height, level, config.bt709_vui)?;
 
         let va_config = display.create_config(
             vec![
@@ -169,14 +175,22 @@ impl Encoder {
             PROFILE,
             ENTRYPOINT,
         )?;
-        let surfaces = display.create_surfaces(
+        let mut surfaces = display.create_surfaces(
+            libva::VA_RT_FORMAT_YUV420,
+            Some(libva::VA_FOURCC_NV12),
+            config.width,
+            config.height,
+            Some(UsageHint::USAGE_HINT_ENCODER | UsageHint::USAGE_HINT_VPP_WRITE),
+            vec![()],
+        )?;
+        surfaces.extend(display.create_surfaces(
             libva::VA_RT_FORMAT_YUV420,
             Some(libva::VA_FOURCC_NV12),
             coded_w,
             coded_h,
             Some(UsageHint::USAGE_HINT_ENCODER),
-            vec![(), (), ()],
-        )?;
+            vec![(), ()],
+        )?);
         let context =
             display.create_context(&va_config, coded_w, coded_h, Some(&surfaces), true)?;
         let coded = context.create_enc_coded((coded_w * coded_h * 3 / 2) as usize)?;
@@ -209,27 +223,35 @@ impl Encoder {
             idr_pic_id: 0,
             encoded_idrs: 0,
             fallback_headers,
+            display,
         })
     }
 
-    fn coded_size(&self) -> (u32, u32) {
-        (self.mb_w * 16, self.mb_h * 16)
+    /// The VA display the encoder was opened on: the VPP and imported capture buffers must use
+    /// it to write into [`Self::input_surface`].
+    pub fn display(&self) -> &Rc<Display> {
+        &self.display
+    }
+
+    /// The NV12 surface [`Self::encode`] reads, `width` x `height`. It keeps its content between
+    /// frames, so encoding it again repeats the last picture (keepalive, IDR on a still screen).
+    pub fn input_surface(&self) -> &Surface<()> {
+        &self.surfaces[0]
     }
 
     /// Writes synthetic frame `index` into the input surface.
     pub fn upload_synthetic(&mut self, index: u32) -> Result<(), Error> {
-        let (coded_w, coded_h) = self.coded_size();
+        let (width, height) = (self.config.width, self.config.height);
         let input = &self.surfaces[0];
         {
-            let mut image =
-                Image::create_from(input, self.nv12, (coded_w, coded_h), (coded_w, coded_h))?;
+            let mut image = Image::create_from(input, self.nv12, (width, height), (width, height))?;
             let va_image = *image.image();
             synthetic::fill_nv12(
                 image.as_mut(),
                 [va_image.pitches[0] as usize, va_image.pitches[1] as usize],
                 [va_image.offsets[0] as usize, va_image.offsets[1] as usize],
-                coded_w as usize,
-                coded_h as usize,
+                width as usize,
+                height as usize,
                 index as usize,
             );
         } // dropping the Image writes it back when it was not derived
@@ -250,6 +272,11 @@ impl Encoder {
             u32::from(sps.log2_max_pic_order_cnt_lsb_minus4),
             0,
         );
+        // The VUI flags VA has (aspect ratio, timing, bitstream restriction) all stay 0; the
+        // colour description it lacks travels in the packed SPS
+        let vui = sps
+            .vui_parameters_present_flag
+            .then(|| H264VuiFields::new(0, 0, 0, 0, 0, 0, 0, 0));
         let crop = sps.frame_cropping_flag.then(|| {
             H264EncFrameCropOffsets::new(
                 sps.frame_crop_left_offset,
@@ -276,7 +303,7 @@ impl Encoder {
             0,
             [0; 256],
             crop,
-            None,
+            vui,
             0,
             0,
             0,
@@ -487,7 +514,7 @@ pub fn spawn_test_source(
                 }
                 let now = Instant::now();
                 let pts = now - start;
-                let idr = scheduler.next_is_idr(now);
+                let idr = scheduler.next_is_idr(pts);
                 let result = encoder
                     .upload_synthetic(index)
                     .and_then(|()| encoder.encode(index, idr));

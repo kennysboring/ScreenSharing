@@ -32,7 +32,14 @@ pub fn level_for(width: u32, height: u32, fps: u32) -> Level {
 }
 
 /// SPS and PPS of the stream: Constrained Baseline, CAVLC, one reference frame, POC type 2.
-pub fn build_headers(width: u32, height: u32, level: Level) -> Result<(Rc<Sps>, Rc<Pps>), Error> {
+/// `bt709_vui` declares BT.709 limited range in the SPS VUI. The VA sequence buffer has no colour
+/// fields: Mesa reads them from the packed SPS and writes them in its own SPS.
+pub fn build_headers(
+    width: u32,
+    height: u32,
+    level: Level,
+    bt709_vui: bool,
+) -> Result<(Rc<Sps>, Rc<Pps>), Error> {
     // frame_mbs_only and chroma_format must be set before resolution(), which computes the crop
     let mut sps = SpsBuilder::new()
         .seq_parameter_set_id(0)
@@ -50,6 +57,27 @@ pub fn build_headers(width: u32, height: u32, level: Level) -> Result<(Rc<Sps>, 
     let sps_mut = Rc::get_mut(&mut sps).ok_or("SPS is shared")?;
     sps_mut.constraint_set0_flag = true;
     sps_mut.constraint_set1_flag = true;
+    if bt709_vui {
+        // Only the video signal type: limited range (16-235), BT.709 primaries, transfer and
+        // matrix (H.264 Tables E-3/E-4/E-5 value 1); every other part of the VUI is absent
+        sps_mut.vui_parameters_present_flag = true;
+        let vui = &mut sps_mut.vui_parameters;
+        vui.aspect_ratio_info_present_flag = false;
+        vui.overscan_info_present_flag = false;
+        vui.video_signal_type_present_flag = true;
+        vui.video_format = 5; // unspecified
+        vui.video_full_range_flag = false;
+        vui.colour_description_present_flag = true;
+        vui.colour_primaries = 1;
+        vui.transfer_characteristics = 1;
+        vui.matrix_coefficients = 1;
+        vui.chroma_loc_info_present_flag = false;
+        vui.timing_info_present_flag = false;
+        vui.nal_hrd_parameters_present_flag = false;
+        vui.vcl_hrd_parameters_present_flag = false;
+        vui.pic_struct_present_flag = false;
+        vui.bitstream_restriction_flag = false;
+    }
     let pps = PpsBuilder::new(Rc::clone(&sps))
         .pic_parameter_set_id(0)
         .pic_init_qp(QP)
@@ -195,7 +223,7 @@ mod tests {
     #[test]
     fn test_headers_match_the_vce_spike_output() {
         // SPS/PPS that Mesa's VCE backend returned in spikes/encoder for 1920x1080 at level 4.0
-        let (sps, pps) = build_headers(1920, 1080, Level::L4).unwrap();
+        let (sps, pps) = build_headers(1920, 1080, Level::L4, false).unwrap();
         let mut headers = sps_bytes(&sps).unwrap();
         headers.extend(pps_bytes(&pps).unwrap());
         assert_eq!(
@@ -203,6 +231,22 @@ mod tests {
             [
                 0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x28, 0x91, 0xa0, 0x1e, 0x00, 0x89, 0xf9, 0x50, 0, 0,
                 0, 1, 0x68, 0xce, 0x38, 0x80
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bt709_vui_headers_match_the_driver_output() {
+        // SPS/PPS Mesa's VCE backend wrote in spikes/encoder --encode-vpp (out-vpp.h264): it
+        // parses the VUI from the packed SPS and writes the same bytes
+        let (sps, pps) = build_headers(1920, 1080, Level::L4, true).unwrap();
+        let mut headers = sps_bytes(&sps).unwrap();
+        headers.extend(pps_bytes(&pps).unwrap());
+        assert_eq!(
+            headers,
+            [
+                0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x28, 0x91, 0xa0, 0x1e, 0x00, 0x89, 0xf9, 0x66, 0xa0,
+                0x20, 0x20, 0x20, 0x40, 0, 0, 0, 1, 0x68, 0xce, 0x38, 0x80
             ]
         );
     }

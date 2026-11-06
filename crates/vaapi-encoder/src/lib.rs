@@ -1,17 +1,21 @@
 //! H.264 Constrained Baseline encoding through VA-API, as validated in `spikes/encoder` on an
 //! RX 580 (Mesa radeonsi, VCE).
 //!
-//! The GPU-free parts (bitstream headers, IDR scheduling, synthetic frames, the kernel lock)
-//! always build and are tested by `cargo test`. The encoder itself is in [`vaapi`], behind the
-//! `vaapi` feature, because it needs libva and libclang to build.
+//! The GPU-free parts (bitstream headers, IDR scheduling, frame pacing, synthetic frames, the
+//! kernel lock) always build and are tested by `cargo test`. The encoder ([`vaapi`]) and the
+//! RGB to NV12 conversion of capture buffers ([`vpp`]) are behind the `vaapi` feature, because
+//! they need libva and libclang to build.
 
 pub mod bitstream;
 pub mod kernel;
+pub mod pacer;
 pub mod schedule;
 pub mod synthetic;
 
 #[cfg(feature = "vaapi")]
 pub mod vaapi;
+#[cfg(feature = "vaapi")]
+pub mod vpp;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 

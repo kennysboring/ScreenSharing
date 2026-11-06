@@ -134,6 +134,9 @@ pub fn start_vaapi_test_source(
         fps: VAAPI_TEST_FPS,
         gop_frames: 2 * VAAPI_TEST_FPS,
         min_forced_idr_interval: Duration::from_secs(1),
+        // The synthetic frame is limited range (luma 16-235) and the screen source sends this
+        // same SPS, so the test pattern exercises it
+        bt709_vui: true,
     };
     let publish = frames.clone();
     // The thread runs for the life of the process; its handle is not needed

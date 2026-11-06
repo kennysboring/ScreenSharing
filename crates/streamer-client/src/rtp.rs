@@ -20,6 +20,12 @@ const RTP_HEADER_SIZE: usize = 12;
 const VIDEO_CLOCK_RATE: u128 = 90_000;
 
 /// Turns a session's frames into RTP packets.
+///
+/// TODO: when bandwidth control (rate adaptation) is added, these packets will need the
+/// abs-send-time and transport-wide-cc header extensions: the browser builds its bandwidth
+/// estimate (GCC) from them. TrackLocalStaticSample's packetizer added abs-send-time and these
+/// packets carry none; whether webrtc-rs's TWCC interceptor adds transport-cc to packets sent
+/// with write_rtp was not checked.
 pub struct RtpStamper {
     payloader: H264Payloader,
     ssrc: u32,

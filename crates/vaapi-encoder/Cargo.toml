@@ -7,6 +7,9 @@ edition = "2024"
 # The VA-API encoder itself. Off by default: it needs libva headers and libclang (bindgen) to
 # build, and an AMD VCE on kernel 6.18 to run. Without it only the GPU-free parts compile.
 vaapi = ["dep:libva"]
+# The ignored tests that need the GPU (tests/vpp_gpu.rs), run with
+# `cargo test -p vaapi-encoder --features gpu-tests -- --ignored`. None of them encodes.
+gpu-tests = ["vaapi", "dep:gbm-sys"]
 
 [dependencies]
 # Only for its public SPS/PPS builder and writer (codec::h264); no features, so pure Rust
@@ -14,3 +17,5 @@ cros-codecs = { version = "0.0.6", default-features = false }
 # cros-libva main: builds against libva 2.23+, has packed headers. Pinned to the commit that
 # fixed the libva 2.23 VP9 fields (2026-09-01), as validated in spikes/encoder.
 libva = { package = "cros-libva", git = "https://github.com/chromeos/cros-libva", rev = "59384456ac2ae78c0c3e5515f41ef1efd9b802cf", optional = true }
+# Only for gpu-tests: allocates an XRGB8888 LINEAR DMA-BUF as a capture would deliver it
+gbm-sys = { version = "0.3.1", optional = true }

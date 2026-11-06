@@ -40,6 +40,17 @@ pub fn fill_nv12(
     }
 }
 
+/// Y'CbCr in BT.709 limited range (Y 16-235, Cb/Cr 16-240) of a full-range R'G'B' color: only
+/// the matrix, no transfer curve conversion, which is what the VPP is set up to do.
+pub fn rgb_to_bt709_limited(rgb: [u8; 3]) -> [f64; 3] {
+    let (kr, kb) = (0.2126, 0.0722);
+    let [r, g, b] = rgb.map(|c| f64::from(c) / 255.0);
+    let y = kr * r + (1.0 - kr - kb) * g + kb * b;
+    let cb = (b - y) / (2.0 * (1.0 - kb));
+    let cr = (r - y) / (2.0 * (1.0 - kr));
+    [16.0 + 219.0 * y, 128.0 + 224.0 * cb, 128.0 + 224.0 * cr]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,6 +70,18 @@ mod tests {
         }
         assert_eq!(&data[16..20], &[U_VALUE, V_VALUE, U_VALUE, V_VALUE]);
         assert_eq!(&data[20..22], &[PAD, PAD], "chroma padding");
+    }
+
+    #[test]
+    fn test_bt709_limited_reference_values() {
+        let round = |v: [f64; 3]| v.map(|x| x.round() as i32);
+        assert_eq!(
+            round(rgb_to_bt709_limited([255, 255, 255])),
+            [235, 128, 128]
+        );
+        assert_eq!(round(rgb_to_bt709_limited([0, 0, 0])), [16, 128, 128]);
+        assert_eq!(round(rgb_to_bt709_limited([255, 0, 0])), [63, 102, 240]);
+        assert_eq!(round(rgb_to_bt709_limited([0, 0, 255])), [32, 240, 118]);
     }
 
     #[test]
