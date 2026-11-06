@@ -1,4 +1,4 @@
-//! H.264 Constrained Baseline encoding through VA-API, as validated in `spikes/encoder2` on an
+//! H.264 Constrained Baseline encoding through VA-API, as validated in `spikes/encoder` on an
 //! RX 580 (Mesa radeonsi, VCE).
 //!
 //! The GPU-free parts (bitstream headers, IDR scheduling, synthetic frames, the kernel lock)

@@ -12,5 +12,5 @@ vaapi = ["dep:libva"]
 # Only for its public SPS/PPS builder and writer (codec::h264); no features, so pure Rust
 cros-codecs = { version = "0.0.6", default-features = false }
 # cros-libva main: builds against libva 2.23+, has packed headers. Pinned to the commit that
-# fixed the libva 2.23 VP9 fields (2026-09-01), as validated in spikes/encoder2.
+# fixed the libva 2.23 VP9 fields (2026-09-01), as validated in spikes/encoder.
 libva = { package = "cros-libva", git = "https://github.com/chromeos/cros-libva", rev = "59384456ac2ae78c0c3e5515f41ef1efd9b802cf", optional = true }

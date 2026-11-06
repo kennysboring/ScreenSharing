@@ -1,5 +1,5 @@
-//! Encoder spike v2: H.264 Constrained Baseline through cros-libva directly (no cros-codecs
-//! encoder, no GBM).
+//! Encoder spike: H.264 Constrained Baseline through cros-libva directly (no cros-codecs
+//! encoder; GBM only allocates the RGB input of the VPP modes).
 //!
 //! - no flags: only queries the driver (safe on any kernel);
 //! - `--prepend [--size WxH]`: CPU only, writes SPS + PPS + `out-idr.h264` to

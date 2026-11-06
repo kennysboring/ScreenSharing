@@ -22,8 +22,14 @@ pub enum PanelStatus {
 
 pub enum Phase {
     Creating,
-    Live { viewer_link: String },
-    Error { message: String },
+    Live {
+        viewer_link: String,
+    },
+    // TODO: Used when reconnecting with backoff (connection signal dropped)
+    #[allow(dead_code)]
+    Error {
+        message: String,
+    },
 }
 
 pub struct Panel {

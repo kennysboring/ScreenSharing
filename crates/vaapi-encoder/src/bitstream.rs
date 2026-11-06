@@ -5,7 +5,7 @@
 //! `radeon_vce.c`): `frame_num` always has 7 bits, and the PPS declares deblocking fields only
 //! when the filter is disabled or has offsets. Our SPS/PPS must agree with those choices, both
 //! to fill the VA parameter buffers consistently and to be a valid fallback when an IDR comes
-//! back without headers. In spikes/encoder2 the driver's SPS/PPS were byte-identical to these.
+//! back without headers. In spikes/encoder the driver's SPS/PPS were byte-identical to these.
 
 use crate::Error;
 use cros_codecs::codec::h264::{
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_headers_match_the_vce_spike_output() {
-        // SPS/PPS that Mesa's VCE backend returned in spikes/encoder2 for 1920x1080 at level 4.0
+        // SPS/PPS that Mesa's VCE backend returned in spikes/encoder for 1920x1080 at level 4.0
         let (sps, pps) = build_headers(1920, 1080, Level::L4).unwrap();
         let mut headers = sps_bytes(&sps).unwrap();
         headers.extend(pps_bytes(&pps).unwrap());
