@@ -1,15 +1,16 @@
 //! WebRTC session with one viewer: creates the offer, applies the answer and the ICE candidates.
 
+use crate::keyframe::{FORWARDER_SLOT, KeyframeRequestForwarder};
 use crate::video::{self, FrameSource};
 use rtc::{
-    interceptor::Registry,
+    interceptor::{Registry, Slot},
     media_stream::MediaStreamTrack,
     peer_connection::configuration::media_engine::MIME_TYPE_H264,
     rtp_transceiver::{
         PayloadType,
         rtp_sender::{
-            RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
-            RtpCodecKind,
+            RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+            RTCRtpEncodingParameters, RtpCodecKind,
         },
     },
 };
@@ -119,14 +120,28 @@ pub async fn make_offer(
             clock_rate: 90000,
             channels: 0,
             sdp_fmtp_line: h264_fmtp_line(source.h264_level()),
-            rtcp_feedback: vec![],
+            // Lets the browser ask for a keyframe (PLI, FIR) when it loses the picture
+            rtcp_feedback: vec![
+                RTCPFeedback {
+                    typ: "nack".to_owned(),
+                    parameter: "pli".to_owned(),
+                },
+                RTCPFeedback {
+                    typ: "ccm".to_owned(),
+                    parameter: "fir".to_owned(),
+                },
+            ],
         },
         payload_type: 102,
     };
 
     let mut media_engine = MediaEngine::default();
     media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
-    let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+    // Last in the chain: hands PLI/FIR to the session as track events
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)?.with(
+        Slot::from(FORWARDER_SLOT),
+        KeyframeRequestForwarder::default(),
+    );
 
     let (connected_tx, connected_rx) = channel::<()>(1);
 
@@ -236,6 +251,9 @@ mod tests {
         assert!(sdp.contains("H264/90000"));
         assert!(sdp.contains("profile-level-id=42e01f"));
         assert!(sdp.contains("packetization-mode=1"));
+        // The browser may only send the keyframe requests the offer allows
+        assert!(sdp.contains("a=rtcp-fb:102 nack pli"));
+        assert!(sdp.contains("a=rtcp-fb:102 ccm fir"));
         assert!(!session.answered);
         assert!(session.pending.is_empty());
 

@@ -13,7 +13,10 @@ use tokio::{
     sync::{broadcast, mpsc::Receiver},
     time::{Interval, interval},
 };
-use webrtc::media_stream::{Track, track_local::static_sample::TrackLocalStaticSample};
+use webrtc::media_stream::{
+    Track,
+    track_local::{TrackLocal, TrackLocalEvent, static_sample::TrackLocalStaticSample},
+};
 
 #[derive(Default)]
 pub struct KeyframeGate {
@@ -46,13 +49,26 @@ pub struct EncodedFrame {
 /// H.264 level of `TEST_VIDEO_PATH`: its SPS starts `42 c0 1f`, level_idc 31 (3.1).
 pub const TEST_VIDEO_H264_LEVEL: u8 = 0x1f;
 
+/// Asks the frame source for an IDR. The source rate limits the requests; only a live encoder
+/// can honor them, so for the test file this does nothing.
+#[derive(Clone)]
+pub struct KeyframeRequester(Option<std::sync::mpsc::Sender<()>>);
+
+impl KeyframeRequester {
+    /// A no-op when the source cannot produce keyframes or its encoder thread is gone.
+    pub fn request(&self) {
+        if let Some(keyframes) = &self.0 {
+            let _ = keyframes.send(());
+        }
+    }
+}
+
 /// What a session needs from the shared frame source: the frames, the H.264 level they are
-/// encoded at (announced in the SDP offer), and a way to ask for a keyframe. Only a live encoder
-/// can honor that request; the test file cannot.
+/// encoded at (announced in the SDP offer), and a way to ask for a keyframe.
 #[derive(Clone)]
 pub struct FrameSource {
     frames: broadcast::Sender<EncodedFrame>,
-    keyframes: Option<std::sync::mpsc::Sender<()>>,
+    keyframes: KeyframeRequester,
     h264_level: u8,
 }
 
@@ -64,9 +80,14 @@ impl FrameSource {
     ) -> Self {
         Self {
             frames,
-            keyframes,
+            keyframes: KeyframeRequester(keyframes),
             h264_level,
         }
+    }
+
+    /// A handle to ask for keyframes that does not keep the frame channel open.
+    pub fn keyframe_requester(&self) -> KeyframeRequester {
+        self.keyframes.clone()
     }
 
     /// level_idc of the stream (for example 31 for 3.1, 40 for 4.0).
@@ -77,14 +98,22 @@ impl FrameSource {
     pub fn subscribe(&self) -> broadcast::Receiver<EncodedFrame> {
         self.frames.subscribe()
     }
+}
 
-    /// Asks the source for an IDR soon (it rate limits them). A no-op for sources that cannot
-    /// produce one, or when the encoder thread is gone.
-    pub fn request_keyframe(&self) {
-        if let Some(keyframes) = &self.keyframes {
-            let _ = keyframes.send(());
+/// Forwards the browser's keyframe requests (PLI/FIR, see `keyframe`) from this session's track
+/// to the source, through the same channel the subscription uses. Ends when the track is
+/// unbound, that is when the connection closes.
+fn spawn_keyframe_listener(track: Arc<TrackLocalStaticSample>, keyframes: KeyframeRequester) {
+    tokio::spawn(async move {
+        while let Some(event) = track.poll().await {
+            if let TrackLocalEvent::OnRtcpPacket(packets) = event
+                && crate::keyframe::contains_keyframe_request(&packets)
+            {
+                println!("keyframe request from the viewer (PLI/FIR)");
+                keyframes.request();
+            }
         }
-    }
+    });
 }
 
 /// Synthetic VA-API source: 30 fps to match `H26X_FRAME_DURATION`, which `forward_frames` uses
@@ -141,10 +170,13 @@ pub fn start_session_video(
             Ok(Some(())) => {
                 // Subscribe only now, so no frames pile up while ICE is negotiating
                 let frames_rx = source.subscribe();
-                // A live encoder starts a new GOP for us instead of making us wait for one
-                source.request_keyframe();
+                let keyframes = source.keyframe_requester();
                 // Holding a sender here would keep the channel from ever closing
                 drop(source);
+                // A live encoder starts a new GOP for us instead of making us wait for one
+                keyframes.request();
+                // Later requests come from the browser when it loses the picture
+                spawn_keyframe_listener(Arc::clone(&track), keyframes);
 
                 let Some(&ssrc) = track.ssrcs().await.first() else {
                     println!("Track has no SSRC");
@@ -579,8 +611,8 @@ mod tests {
         let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel();
         let source = FrameSource::new(frames, Some(keyframe_tx), TEST_VIDEO_H264_LEVEL);
 
-        source.clone().request_keyframe();
-        source.request_keyframe();
+        source.clone().keyframe_requester().request();
+        source.keyframe_requester().request();
 
         assert_eq!(keyframe_rx.try_iter().count(), 2);
     }
@@ -589,12 +621,16 @@ mod tests {
     fn test_frame_source_without_encoder_ignores_requests() {
         let (frames, _) = broadcast::channel(1);
         // The file source: nothing to ask, nothing to fail
-        FrameSource::new(frames.clone(), None, TEST_VIDEO_H264_LEVEL).request_keyframe();
+        FrameSource::new(frames.clone(), None, TEST_VIDEO_H264_LEVEL)
+            .keyframe_requester()
+            .request();
 
         // An encoder thread that is gone: the request is dropped, not a panic
         let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel();
         drop(keyframe_rx);
-        FrameSource::new(frames, Some(keyframe_tx), TEST_VIDEO_H264_LEVEL).request_keyframe();
+        FrameSource::new(frames, Some(keyframe_tx), TEST_VIDEO_H264_LEVEL)
+            .keyframe_requester()
+            .request();
     }
 
     #[tokio::test]

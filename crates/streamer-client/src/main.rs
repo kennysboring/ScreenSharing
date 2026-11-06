@@ -1,3 +1,4 @@
+mod keyframe;
 mod panel;
 mod peer;
 mod signaling;
