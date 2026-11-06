@@ -14,10 +14,10 @@ use rtc::{
         },
     },
 };
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use webrtc::{
-    media_stream::track_local::{TrackLocal, static_sample::TrackLocalStaticSample},
+    media_stream::track_local::{TrackLocal, static_rtp::TrackLocalStaticRTP},
     peer_connection::{
         MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
         RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer, RTCPeerConnectionIceEvent,
@@ -44,7 +44,7 @@ impl PeerConnectionEventHandler for Handler {
 
 pub struct Session {
     pub pc: Arc<dyn PeerConnection>,
-    pub track: Arc<TrackLocalStaticSample>,
+    pub track: Arc<TrackLocalStaticRTP>,
     pub sender: Arc<dyn RtpSender>,
     pub answered: bool,
     pub pending: Vec<RTCIceCandidateInit>,
@@ -155,23 +155,21 @@ pub async fn make_offer(
         .await?;
 
     let ssrc = rand::random::<u32>();
-    let track = Arc::new(TrackLocalStaticSample::new(
-        Instant::now(),
-        MediaStreamTrack::new(
-            "stream".to_string(),
-            "track".to_string(),
-            "label".to_string(),
-            RtpCodecKind::Video,
-            vec![RTCRtpEncodingParameters {
-                rtp_coding_parameters: RTCRtpCodingParameters {
-                    ssrc: Some(ssrc),
-                    ..Default::default()
-                },
-                codec: video_codec.rtp_codec.clone(),
+    // RTP track: the session packetizes and timestamps the frames itself (see `rtp`)
+    let track = Arc::new(TrackLocalStaticRTP::new(MediaStreamTrack::new(
+        "stream".to_string(),
+        "track".to_string(),
+        "label".to_string(),
+        RtpCodecKind::Video,
+        vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters {
+                ssrc: Some(ssrc),
                 ..Default::default()
-            }],
-        ),
-    )?);
+            },
+            codec: video_codec.rtp_codec.clone(),
+            ..Default::default()
+        }],
+    )));
 
     let pc: Arc<dyn PeerConnection> = Arc::new(pc);
     let sender = pc

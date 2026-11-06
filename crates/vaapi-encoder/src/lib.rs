@@ -15,10 +15,10 @@ pub mod vaapi;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-/// One NAL unit without its start code. SPS and PPS are not timed; slices are (they advance the
-/// presentation clock), as the streamer-client's `EncodedFrame` expects.
+/// One NAL unit without its start code. `last_in_frame` marks the NAL that completes a picture
+/// (the slice; SPS and PPS come before it), where the RTP marker goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nal {
     pub data: Vec<u8>,
-    pub timed: bool,
+    pub last_in_frame: bool,
 }

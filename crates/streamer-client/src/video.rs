@@ -1,21 +1,14 @@
+use crate::rtp::RtpStamper;
 use bytes::Bytes;
-use rtc::{
-    media::{Sample, io::h26x_reader::H26xSampleReader},
-    rtp_transceiver::PayloadType,
-};
-use std::{
-    fs::File,
-    io::BufReader,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use rtc::{media::io::h26x_reader::H26xSampleReader, rtp_transceiver::PayloadType};
+use std::{fs::File, io::BufReader, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc::Receiver},
     time::{Interval, interval},
 };
 use webrtc::media_stream::{
     Track,
-    track_local::{TrackLocal, TrackLocalEvent, static_sample::TrackLocalStaticSample},
+    track_local::{TrackLocal, TrackLocalEvent, static_rtp::TrackLocalStaticRTP},
 };
 
 #[derive(Default)]
@@ -40,10 +33,16 @@ impl KeyframeGate {
     }
 }
 
+/// One H.264 NAL unit without start code, as the source publishes it.
 #[derive(Clone)]
 pub struct EncodedFrame {
     pub data: Bytes,
-    pub timed: bool,
+    /// Capture time of the picture this NAL belongs to, on the source's own clock (any origin).
+    /// SPS and PPS carry the pts of the IDR they precede. Sessions derive the RTP timestamp
+    /// from it (see `rtp`), so every frame keeps its own time even at a variable frame rate.
+    pub pts: Duration,
+    /// Last NAL of its picture: the RTP marker goes on its last packet.
+    pub last_in_frame: bool,
 }
 
 /// H.264 level of `TEST_VIDEO_PATH`: its SPS starts `42 c0 1f`, level_idc 31 (3.1).
@@ -103,7 +102,7 @@ impl FrameSource {
 /// Forwards the browser's keyframe requests (PLI/FIR, see `keyframe`) from this session's track
 /// to the source, through the same channel the subscription uses. Ends when the track is
 /// unbound, that is when the connection closes.
-fn spawn_keyframe_listener(track: Arc<TrackLocalStaticSample>, keyframes: KeyframeRequester) {
+fn spawn_keyframe_listener(track: Arc<TrackLocalStaticRTP>, keyframes: KeyframeRequester) {
     tokio::spawn(async move {
         while let Some(event) = track.poll().await {
             if let TrackLocalEvent::OnRtcpPacket(packets) = event
@@ -116,8 +115,7 @@ fn spawn_keyframe_listener(track: Arc<TrackLocalStaticSample>, keyframes: Keyfra
     });
 }
 
-/// Synthetic VA-API source: 30 fps to match `H26X_FRAME_DURATION`, which `forward_frames` uses
-/// as the duration of every timed frame.
+/// Synthetic VA-API source frame rate.
 #[cfg(feature = "vaapi")]
 const VAAPI_TEST_FPS: u32 = 30;
 
@@ -139,11 +137,12 @@ pub fn start_vaapi_test_source(
     };
     let publish = frames.clone();
     // The thread runs for the life of the process; its handle is not needed
-    vaapi_encoder::vaapi::spawn_test_source(config, keyframe_rx, move |nal| {
+    vaapi_encoder::vaapi::spawn_test_source(config, keyframe_rx, move |nal, pts| {
         // No receivers is not an error: the encoder keeps its pace for whoever joins later
         let _ = publish.send(EncodedFrame {
             data: Bytes::from(nal.data),
-            timed: nal.timed,
+            pts,
+            last_in_frame: nal.last_in_frame,
         });
     })
     .map_err(|e| format!("VA-API source: {e}"))?;
@@ -160,7 +159,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// keyframe and sends the frames to its track, starting at the next keyframe. Gives up if it
 /// does not connect within `CONNECT_TIMEOUT`.
 pub fn start_session_video(
-    track: Arc<TrackLocalStaticSample>,
+    track: Arc<TrackLocalStaticRTP>,
     payload_type: PayloadType,
     mut connected_rx: Receiver<()>,
     source: FrameSource,
@@ -182,19 +181,19 @@ pub fn start_session_video(
                     println!("Track has no SSRC");
                     return;
                 };
-                // Each call owns a handle to the track, so the future does not borrow the
-                // closure and the task stays Send
-                let write = |data: Bytes, duration: Duration| {
+                // Random sequence start and timestamp base, as RFC 3550 asks
+                let mut stamper =
+                    RtpStamper::new(ssrc, payload_type, rand::random(), rand::random());
+                // Packets are built before the future, which only owns a handle to the track:
+                // the future does not borrow the closure and the task stays Send
+                let write = |frame: EncodedFrame| {
+                    let packets = stamper.packetize(&frame);
                     let track = Arc::clone(&track);
                     async move {
-                        track
-                            .sample_writer(ssrc, payload_type)
-                            .write_sample(&Sample {
-                                data,
-                                duration,
-                                ..Sample::new(Instant::now())
-                            })
-                            .await
+                        for packet in packets? {
+                            track.write_rtp(packet).await.map_err(|e| e.to_string())?;
+                        }
+                        Ok::<(), String>(())
                     }
                 };
                 // The error is not printed: a failed write carries the whole RTP packet
@@ -221,7 +220,7 @@ async fn forward_frames<E, F, Fut>(
     mut sink: F,
 ) -> Result<(), E>
 where
-    F: FnMut(Bytes, Duration) -> Fut,
+    F: FnMut(EncodedFrame) -> Fut,
     Fut: Future<Output = Result<(), E>>,
 {
     let mut gate = KeyframeGate::default();
@@ -232,13 +231,7 @@ where
                 if !gate.should_send(nal_type(&frame.data)) {
                     continue;
                 }
-                // SPS, PPS and IDR are one frame: only the timed one moves the clock
-                let duration = if frame.timed {
-                    H26X_FRAME_DURATION
-                } else {
-                    Duration::ZERO
-                };
-                sink(frame.data, duration).await?;
+                sink(frame).await?;
             }
             // Frames were dropped, so the next P-frames lack their reference: wait for an SPS
             Err(broadcast::error::RecvError::Lagged(_)) => gate.wait_for_keyframe(),
@@ -257,10 +250,12 @@ fn nal_type(data: &[u8]) -> Option<u8> {
 /// Stops if the file cannot be read or has no frames.
 pub fn start_test_source(tx: broadcast::Sender<EncodedFrame>, path: String) {
     tokio::spawn(async move {
-        // One ticker for every pass, so the pace carries on across the restart
+        // One ticker and one frame count for every pass, so the pace and the pts carry on
+        // across the restart
         let mut ticker = interval(H26X_FRAME_DURATION);
+        let mut frames = 0u32;
         loop {
-            match send_file_once(&tx, &path, &mut ticker).await {
+            match send_file_once(&tx, &path, &mut ticker, &mut frames).await {
                 // Without this check an empty file would restart forever without waiting
                 Ok(0) => {
                     eprintln!("Test video has no frames: {path}");
@@ -276,10 +271,13 @@ pub fn start_test_source(tx: broadcast::Sender<EncodedFrame>, path: String) {
     });
 }
 
+/// `frames` counts the pictures sent so far; picture n gets pts n x 33 ms, and the SPS/PPS before
+/// an IDR get the IDR's pts.
 async fn send_file_once(
     tx: &broadcast::Sender<EncodedFrame>,
     path: &str,
     ticker: &mut Interval,
+    frames: &mut u32,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(path)?;
     let mut video_reader = H26xSampleReader::new(BufReader::new(file), 1_048_576, false);
@@ -295,11 +293,14 @@ async fn send_file_once(
         // No receivers is not an error: the source keeps its pace for whoever joins later
         let _ = tx.send(EncodedFrame {
             data: sample.data,
-            timed: sample.timed,
+            pts: H26X_FRAME_DURATION * *frames,
+            // The reader marks as timed the NAL that completes a picture
+            last_in_frame: sample.timed,
         });
         sent += 1;
 
         if sample.timed {
+            *frames += 1;
             ticker.tick().await;
         }
     }
@@ -421,14 +422,14 @@ mod tests {
         start_test_source(tx, path.to_str().unwrap().to_owned());
 
         // Arrival time of the next timed frame, skipping the untimed SPS/PPS
-        async fn next_timed(rx: &mut broadcast::Receiver<EncodedFrame>) -> Instant {
+        async fn next_timed(rx: &mut broadcast::Receiver<EncodedFrame>) -> std::time::Instant {
             loop {
                 let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
                     .await
                     .expect("source should send a frame in time")
                     .expect("channel should stay open");
-                if frame.timed {
-                    return Instant::now();
+                if frame.last_in_frame {
+                    return std::time::Instant::now();
                 }
             }
         }
@@ -443,6 +444,42 @@ mod tests {
         assert!(
             (Duration::from_millis(20)..=Duration::from_millis(80)).contains(&gap),
             "timed frames should be about 33 ms apart, got {gap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_source_pts_follow_pictures_across_the_restart() {
+        // SPS, PPS, IDR, P-frame: two pictures per pass
+        let path = temp_file_path("pts.h264");
+        let mut stream = Vec::new();
+        for nal in [[0x67, 0x42], [0x68, 0xce], [0x65, 0x88], [0x41, 0x9a]] {
+            stream.extend_from_slice(&[0, 0, 0, 1]);
+            stream.extend_from_slice(&nal);
+        }
+        std::fs::write(&path, stream).expect("should write the test stream");
+
+        let (tx, mut rx) = broadcast::channel(30);
+        start_test_source(tx, path.to_str().unwrap().to_owned());
+        let mut got = Vec::new();
+        for _ in 0..8 {
+            let f = recv_frame(&mut rx).await.expect("channel should stay open");
+            got.push((nal_type(&f.data), f.pts.as_millis(), f.last_in_frame));
+        }
+        let _ = std::fs::remove_file(&path);
+
+        // SPS/PPS share the IDR's pts; the second pass goes on from picture 2
+        assert_eq!(
+            got,
+            [
+                (Some(7), 0, false),
+                (Some(8), 0, false),
+                (Some(5), 0, true),
+                (Some(1), 33, true),
+                (Some(7), 66, false),
+                (Some(8), 66, false),
+                (Some(5), 66, true),
+                (Some(1), 99, true),
+            ]
         );
     }
 
@@ -506,11 +543,12 @@ mod tests {
         assert!(matches!(result, Err(broadcast::error::RecvError::Closed)));
     }
 
-    /// A one-byte frame whose NAL type is `nal`.
-    fn frame(nal: u8, timed: bool) -> EncodedFrame {
+    /// A one-byte frame whose NAL type is `nal`; slices end their picture, SPS/PPS do not.
+    fn frame(nal: u8, pts_ms: u64) -> EncodedFrame {
         EncodedFrame {
             data: Bytes::from(vec![nal]),
-            timed,
+            pts: Duration::from_millis(pts_ms),
+            last_in_frame: matches!(nal & 0x1f, 1 | 5),
         }
     }
 
@@ -518,27 +556,24 @@ mod tests {
         assert!(tx.send(frame).is_ok(), "the receiver should be subscribed");
     }
 
-    const ZERO: Duration = Duration::ZERO;
-    const FRAME: Duration = H26X_FRAME_DURATION;
-
     #[tokio::test]
-    async fn test_forward_frames_gates_and_sets_durations() {
+    async fn test_forward_frames_gates_and_keeps_pts() {
         let (tx, rx) = broadcast::channel(16);
-        // A P-frame before the SPS, then SPS, PPS, IDR and a P-frame
+        // A P-frame before the SPS, then SPS, PPS and IDR at 33 ms, and a P-frame at 66 ms
         for f in [
-            frame(0x41, true),
-            frame(0x67, false),
-            frame(0x68, false),
-            frame(0x65, true),
-            frame(0x41, true),
+            frame(0x41, 0),
+            frame(0x67, 33),
+            frame(0x68, 33),
+            frame(0x65, 33),
+            frame(0x41, 66),
         ] {
             send(&tx, f);
         }
         drop(tx);
 
         let mut written = Vec::new();
-        let result = forward_frames(rx, |data: Bytes, duration| {
-            written.push((nal_type(&data), duration));
+        let result = forward_frames(rx, |f: EncodedFrame| {
+            written.push((nal_type(&f.data), f.pts.as_millis(), f.last_in_frame));
             std::future::ready(Ok::<(), ()>(()))
         })
         .await;
@@ -547,10 +582,10 @@ mod tests {
         assert_eq!(
             written,
             [
-                (Some(7), ZERO),
-                (Some(8), ZERO),
-                (Some(5), FRAME),
-                (Some(1), FRAME)
+                (Some(7), 33, false),
+                (Some(8), 33, false),
+                (Some(5), 33, true),
+                (Some(1), 66, true)
             ]
         );
     }
@@ -560,23 +595,23 @@ mod tests {
         let (tx, rx) = broadcast::channel(4);
         // The sink reports each write, so the test knows when the gate is open
         let (written_tx, mut written_rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(forward_frames(rx, move |data: Bytes, _duration| {
-            let _ = written_tx.send(nal_type(&data));
+        let task = tokio::spawn(forward_frames(rx, move |f: EncodedFrame| {
+            let _ = written_tx.send(nal_type(&f.data));
             std::future::ready(Ok::<(), ()>(()))
         }));
 
-        send(&tx, frame(0x67, false));
-        send(&tx, frame(0x41, true));
+        send(&tx, frame(0x67, 0));
+        send(&tx, frame(0x41, 0));
         assert_eq!(written_rx.recv().await, Some(Some(7)));
         assert_eq!(written_rx.recv().await, Some(Some(1)));
 
         // Six P-frames and then SPS + P-frame into a channel of four: the receiver lags and
         // finds 1, 1, 7, 1. The two P-frames that survived the lag must not be written.
-        for _ in 0..6 {
-            send(&tx, frame(0x41, true));
+        for i in 1..=6 {
+            send(&tx, frame(0x41, 33 * i));
         }
-        send(&tx, frame(0x67, false));
-        send(&tx, frame(0x41, true));
+        send(&tx, frame(0x67, 231));
+        send(&tx, frame(0x41, 231));
         drop(tx);
 
         assert_eq!(task.await.expect("task should not panic"), Ok(()));
@@ -590,11 +625,11 @@ mod tests {
     #[tokio::test]
     async fn test_forward_frames_stops_on_sink_error() {
         let (tx, rx) = broadcast::channel(16);
-        send(&tx, frame(0x67, false));
-        send(&tx, frame(0x68, false));
+        send(&tx, frame(0x67, 0));
+        send(&tx, frame(0x68, 0));
 
         let mut calls = 0;
-        let result = forward_frames(rx, |_data: Bytes, _duration| {
+        let result = forward_frames(rx, |_f: EncodedFrame| {
             calls += 1;
             std::future::ready(Err::<(), _>("write failed"))
         })
@@ -639,7 +674,7 @@ mod tests {
         let source = FrameSource::new(frames.clone(), None, TEST_VIDEO_H264_LEVEL);
         let mut rx = source.subscribe();
 
-        send(&frames, frame(0x67, false));
+        send(&frames, frame(0x67, 0));
 
         let received = recv_frame(&mut rx).await.expect("channel should stay open");
         assert_eq!(nal_type(&received.data), Some(7));

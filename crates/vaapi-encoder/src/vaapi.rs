@@ -415,7 +415,8 @@ impl Encoder {
                 for nal in split_nals(segment.buf) {
                     nals.push(Nal {
                         data: nal.to_vec(),
-                        timed: matches!(nal_type(nal), Some(1) | Some(5)),
+                        // One slice per picture: the slice ends it
+                        last_in_frame: matches!(nal_type(nal), Some(1) | Some(5)),
                     });
                 }
             }
@@ -436,7 +437,7 @@ impl Encoder {
                 .iter()
                 .map(|h| Nal {
                     data: h.clone(),
-                    timed: false,
+                    last_in_frame: false,
                 })
                 .collect();
             with_headers.extend(
@@ -450,13 +451,15 @@ impl Encoder {
 }
 
 /// Starts a thread that encodes synthetic frames at `config.fps` and calls `publish` with each
-/// NAL. A message on `keyframe_requests` asks for an IDR, rate limited by
+/// NAL and the pts of its picture (time since the source started, taken when the frame is
+/// produced, so a frame delayed by a stall gets the time it really has).
+/// A message on `keyframe_requests` asks for an IDR, rate limited by
 /// `config.min_forced_idr_interval`. Returns once the encoder is open, or with the error that
 /// prevented opening it.
 pub fn spawn_test_source(
     config: Config,
     keyframe_requests: mpsc::Receiver<()>,
-    mut publish: impl FnMut(Nal) + Send + 'static,
+    mut publish: impl FnMut(Nal, Duration) + Send + 'static,
 ) -> Result<thread::JoinHandle<()>, Error> {
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let handle = thread::Builder::new()
@@ -475,19 +478,21 @@ pub fn spawn_test_source(
             let mut scheduler =
                 IdrScheduler::new(config.gop_frames, config.min_forced_idr_interval);
             let period = Duration::from_secs(1) / config.fps;
-            let mut next = Instant::now();
+            let start = Instant::now();
+            let mut next = start;
             for index in 0u32.. {
                 // Requests from sessions that just subscribed (later also PLIs)
                 while keyframe_requests.try_recv().is_ok() {
                     scheduler.request();
                 }
                 let now = Instant::now();
+                let pts = now - start;
                 let idr = scheduler.next_is_idr(now);
                 let result = encoder
                     .upload_synthetic(index)
                     .and_then(|()| encoder.encode(index, idr));
                 match result {
-                    Ok(nals) => nals.into_iter().for_each(&mut publish),
+                    Ok(nals) => nals.into_iter().for_each(|nal| publish(nal, pts)),
                     Err(e) => {
                         eprintln!("vaapi: encoding frame {index} failed: {e}; stopping");
                         return;
