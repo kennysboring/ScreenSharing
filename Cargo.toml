@@ -6,7 +6,7 @@ members = [
     "crates/common"
 ]
 # Experiments with system dependencies (libpipewire, libva, libclang) stay out of workspace builds
-exclude = ["spikes/capture", "spikes/encoder"]
+exclude = ["spikes/capture", "spikes/encoder2"]
 
 [workspace.dependencies]
 common = { path = "crates/common" }
