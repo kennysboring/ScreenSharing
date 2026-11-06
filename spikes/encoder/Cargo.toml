@@ -7,6 +7,8 @@ publish = false
 [dependencies]
 # Stateless H.264 encoder over VA-API; re-exports its libva wrapper (cros-libva 0.0.12)
 cros-codecs = { version = "0.0.6", features = ["vaapi"] }
+# Raw GBM calls for --alloc-only (same version cros-codecs already uses)
+gbm-sys = "0.3.1"
 
 # cros-libva 0.0.12 does not build against libva 2.23+; see vendor/PATCH.md
 [patch.crates-io]

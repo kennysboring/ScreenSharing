@@ -192,6 +192,7 @@ name = "encoder-spike"
 version = "0.1.0"
 dependencies = [
  "cros-codecs",
+ "gbm-sys",
 ]
 
 [[package]]

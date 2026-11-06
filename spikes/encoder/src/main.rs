@@ -5,6 +5,9 @@
 //! `vainfo`. H.264 encode hung the RX 580's VCE on kernel 7.2.11 (reported as a regression since
 //! 7.2.2, fixed in 7.3-rc2), so `--encode` refuses to run on 7.2.2 to 7.2.x unless
 //! `--ignore-kernel-check` is given.
+//!
+//! `--alloc-only` only tries NV12 allocations through GBM (see `alloc_probe`); it does not open
+//! VA-API at all.
 
 use cros_codecs::{
     BlockingMode, Fourcc, Resolution,
@@ -27,6 +30,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod alloc_probe;
+
 type Error = Box<dyn std::error::Error>;
 
 const RENDER_NODE: &str = "/dev/dri/renderD128";
@@ -34,6 +39,7 @@ const BITRATE: u64 = 6_000_000;
 const FRAMERATE: u32 = 30;
 
 struct Args {
+    alloc_only: bool,
     encode: bool,
     ignore_kernel_check: bool,
     size: Resolution,
@@ -42,6 +48,7 @@ struct Args {
 
 fn parse_args() -> Result<Args, Error> {
     let mut args = Args {
+        alloc_only: false,
         encode: false,
         ignore_kernel_check: false,
         size: Resolution {
@@ -53,6 +60,7 @@ fn parse_args() -> Result<Args, Error> {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--alloc-only" => args.alloc_only = true,
             "--encode" => args.encode = true,
             "--ignore-kernel-check" => args.ignore_kernel_check = true,
             "--size" => {
@@ -281,6 +289,10 @@ fn encode(display: Rc<Display>, args: &Args) -> Result<(), Error> {
 
 fn main() -> Result<(), Error> {
     let args = parse_args()?;
+    // Checked before VA-API is opened: this mode only talks to GBM
+    if args.alloc_only {
+        return alloc_probe::run(RENDER_NODE);
+    }
     let display = Display::open().ok_or("could not open a VA-API display")?;
     query(&display)?;
 
